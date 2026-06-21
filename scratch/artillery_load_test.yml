@@ -1,0 +1,50 @@
+config:
+  target: "http://localhost:5000"
+  phases:
+    - name: "Warmup"
+      duration: 60
+      arrivalRate: 5
+    - name: "Normal Load"
+      duration: 180
+      arrivalRate: 25
+    - name: "Peak Spike"
+      duration: 60
+      arrivalRate: 80
+    - name: "Recovery"
+      duration: 60
+      arrivalRate: 5
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "Storefront User Funnel Flow"
+    flow:
+      # 1. PageView Tracking Beacon
+      - post:
+          url: "/api/tracking/meta/event"
+          json:
+            eventName: "PageView"
+            eventId: "artillery-pv-{{ $uuid }}"
+            eventSourceUrl: "http://localhost:3000/"
+            userData:
+              email: "artillery_user@example.com"
+            customData:
+              userAgent: "Artillery Stress Agent"
+
+      # 2. Browse Products Catalogue
+      - get:
+          url: "/api/products"
+
+      # 3. Add to Cart Tracking Beacon
+      - post:
+          url: "/api/tracking/meta/event"
+          json:
+            eventName: "AddToCart"
+            eventId: "artillery-atc-{{ $uuid }}"
+            eventSourceUrl: "http://localhost:3000/products/sample"
+            userData:
+              email: "artillery_user@example.com"
+            customData:
+              value: 49.99,
+              currency: "USD"
