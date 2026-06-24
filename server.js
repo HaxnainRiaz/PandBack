@@ -39,22 +39,49 @@ const allowedOrigins = [
     'http://127.0.0.1:5000',
     'https://store-pannel.vercel.app',
     'https://store-admin-one.vercel.app',
+    'https://panda-panel-puce.vercel.app',
+    'https://pand-back.vercel.app',
     'https://luminelle.org',
     'https://pandaemart.com',
     'https://www.pandaemart.com'
 ].filter(Boolean);
 
-const isAllowedOrigin = (origin) => !origin || allowedOrigins.includes(origin);
+const allowedOriginPatterns = [
+    /^https:\/\/panda-panel-puce(?:-[a-z0-9-]+)?\.vercel\.app$/i
+];
 
-app.use(cors({
-    origin: (origin, callback) => {
-        callback(null, isAllowedOrigin(origin));
-    },
+const isAllowedOrigin = (origin) => !origin || allowedOrigins.includes(origin) ||
+    allowedOriginPatterns.some((pattern) => pattern.test(origin));
+
+const corsOptions = {
+    origin: (origin, callback) => callback(null, isAllowedOrigin(origin)),
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['X-Requested-With', 'Content-Type', 'Authorization', 'Accept'],
-    maxAge: 86400
-}));
+    maxAge: 86400,
+    optionsSuccessStatus: 204
+};
+
+// Preflight must finish before route-specific database middleware. Otherwise a
+// temporary MongoDB outage is incorrectly surfaced by browsers as a CORS error.
+app.use((req, res, next) => {
+    if (req.method !== 'OPTIONS') return next();
+
+    const origin = req.get('origin');
+    if (!isAllowedOrigin(origin)) {
+        return res.status(403).json({ success: false, message: 'Origin not allowed' });
+    }
+
+    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', corsOptions.methods.join(', '));
+    res.setHeader('Access-Control-Allow-Headers', corsOptions.allowedHeaders.join(', '));
+    res.setHeader('Access-Control-Max-Age', String(corsOptions.maxAge));
+    res.setHeader('Vary', 'Origin');
+    return res.status(204).end();
+});
+
+app.use(cors(corsOptions));
 
 app.use((req, res, next) => {
     const start = Date.now();

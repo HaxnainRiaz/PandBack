@@ -44,6 +44,7 @@ async function testConnectDbReuse() {
 }
 
 async function testHttpRoutes(port) {
+    await request(port, '/health');
     const start = Date.now();
     const health = await request(port, '/health');
     const healthMs = Date.now() - start;
@@ -77,6 +78,29 @@ async function testHttpRoutes(port) {
     });
     assert.strictEqual(corsOrigin, 'https://pandaemart.com');
     console.log('  Production webstore origin is allowed by CORS');
+
+    const preflight = await new Promise((resolve, reject) => {
+        const req = http.request({
+            host: '127.0.0.1',
+            port,
+            path: '/api/auth/login',
+            method: 'OPTIONS',
+            headers: {
+                Origin: 'https://panda-panel-puce.vercel.app',
+                'Access-Control-Request-Method': 'POST',
+                'Access-Control-Request-Headers': 'content-type'
+            }
+        }, (res) => resolve({ statusCode: res.statusCode, headers: res.headers }));
+        req.on('error', reject);
+        req.end();
+    });
+    assert.strictEqual(preflight.statusCode, 204);
+    assert.strictEqual(
+        preflight.headers['access-control-allow-origin'],
+        'https://panda-panel-puce.vercel.app'
+    );
+    assert.ok(preflight.headers['access-control-allow-methods'].includes('POST'));
+    console.log('  Admin login preflight returns 204 before database middleware');
 
     const rootHead = await new Promise((resolve, reject) => {
         const req = http.request({
