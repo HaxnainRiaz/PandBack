@@ -112,6 +112,18 @@ exports.getMetaStatus = async (req, res) => {
             trackingHealthScore: integration?.trackingHealthScore !== undefined ? integration.trackingHealthScore : 100,
             lastSuccessfulCapiAt: integration?.lastSuccessfulCapiAt || null,
             testEventCode: integration?.testEventCode || '',
+            capiStatus: (() => {
+                if (!isActuallyConnected) return 'not_connected';
+                if (!integration?.pixelId) return 'connected_missing_pixel';
+                if (integration?.lastErrorMessage && /expired|invalid token/i.test(integration.lastErrorMessage)) {
+                    return 'token_expired';
+                }
+                if (!integration?.capiAccessTokenEncrypted) return 'capi_config_incomplete';
+                if (integration?.setupCompleted && integration?.pixelId && integration?.capiAccessTokenEncrypted) {
+                    return 'connected_ready';
+                }
+                return 'capi_config_incomplete';
+            })(),
             stats: {
                 totalEvents,
                 queuedEvents,
@@ -377,7 +389,7 @@ exports.saveManualPixel = async (req, res) => {
         integration.pixelId = String(pixelId);
         integration.pixelName = pixelName || 'Manual Pixel';
         integration.isPixelEnabled = true;
-        integration.setupStep = 6;
+        integration.setupStep = 5;
         integration.lastErrorMessage = null;
         await integration.save();
 
@@ -433,6 +445,22 @@ exports.saveMetaSettings = async (req, res) => {
             return res.status(404).json({
                 success: false,
                 message: 'Meta integration not found. Please connect Meta account first.'
+            });
+        }
+
+        if (req.body.setupCompleted === false) {
+            integration.setupCompleted = false;
+            integration.setupStep = Number(req.body.setupStep) || 2;
+            integration.lastErrorMessage = null;
+            await integration.save();
+
+            return res.status(200).json({
+                success: true,
+                message: 'Setup reconfiguration started.',
+                data: {
+                    setupCompleted: false,
+                    setupStep: integration.setupStep
+                }
             });
         }
 

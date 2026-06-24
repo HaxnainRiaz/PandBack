@@ -69,6 +69,26 @@ function normalise(response) {
     return response.data;
 }
 
+function formatPostExAxiosError(err) {
+    const data = err.response?.data;
+    if (data && typeof data === 'object') {
+        const msg = data.statusMessage || data.message || data.error || err.message;
+        const wrapped = new Error(msg);
+        wrapped.postexResponse = data;
+        wrapped.httpStatus = err.response?.status;
+        return wrapped;
+    }
+    return err;
+}
+
+function extractPostExErrorBody(err) {
+    const data = err.response?.data;
+    if (data && typeof data === 'object') {
+        return data;
+    }
+    return null;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -138,14 +158,18 @@ exports.getOrderTypes = async (ownerId) => {
 
 exports.createOrder = async (ownerId, payload) => {
     const token = await resolveToken(ownerId);
-    return withRetry(async () => {
+    try {
         const res = await axios.post(
             `${BASE}/v3/create-order`,
             payload,
-            { headers: buildHeaders(token), timeout: 15000 }
+            { headers: buildHeaders(token), timeout: 15000, validateStatus: () => true }
         );
         return normalise(res);
-    });
+    } catch (err) {
+        const body = extractPostExErrorBody(err);
+        if (body) return body;
+        throw formatPostExAxiosError(err);
+    }
 };
 
 exports.trackOrder = async (ownerId, trackingNumber) => {

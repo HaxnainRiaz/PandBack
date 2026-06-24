@@ -25,7 +25,7 @@ const productSchema = new mongoose.Schema({
         default: ''
     },
     images: {
-        type: [String],
+        type: [mongoose.Schema.Types.Mixed],
         default: ['https://placehold.co/600x600?text=No+Photo'],
     },
     price: {

@@ -1,8 +1,92 @@
 const Order = require('../models/Order');
 const ShipmentLog = require('../models/ShipmentLog');
 const OrderEvent = require('../models/OrderEvent');
+const PostExIntegration = require('../models/PostExIntegration');
 const mongoose = require('mongoose');
 const postexService = require('../services/postex.service');
+
+function getOwnerId(req) {
+    const ownerId = req.user?._id || req.admin?._id || req.user?.id;
+    if (!ownerId || !mongoose.Types.ObjectId.isValid(ownerId)) {
+        return null;
+    }
+    return ownerId;
+}
+
+async function ensurePostExConfigured(ownerId) {
+    const integration = await PostExIntegration.findOne({ ownerId, isConnected: true });
+    if (!integration) {
+        const err = new Error('PostEx is not configured. Please connect your PostEx API token in Settings first.');
+        err.code = 'POSTEX_NOT_CONFIGURED';
+        err.status = 400;
+        throw err;
+    }
+    return integration;
+}
+
+function sanitizePakistanPhone(phone) {
+    if (!phone) return '';
+    let digits = String(phone).replace(/[\s\-()]/g, '');
+    if (digits.startsWith('+92')) digits = `0${digits.slice(3)}`;
+    if (digits.startsWith('92') && digits.length === 12) digits = `0${digits.slice(2)}`;
+    return digits;
+}
+
+function buildBulkBookingPayload(order, entryPayload, integration) {
+    const itemsCount = (order.items || []).reduce((acc, item) => acc + (Number(item.quantity) || 0), 0);
+    const itemsDetail = (order.items || [])
+        .map((i) => `${i.product?.title || i.productName || 'Item'} x${i.quantity}`)
+        .join(', ')
+        .substring(0, 500);
+
+    const cityName = (entryPayload?.cityName || order.cityName || order.shippingAddress?.city || '').trim();
+    const customerName = (entryPayload?.customerName || order.customerName || order.shippingAddress?.fullName || '').trim();
+    const customerPhone = sanitizePakistanPhone(
+        entryPayload?.customerPhone || order.customerPhone || order.shippingAddress?.phone
+    );
+    const deliveryAddress = (entryPayload?.deliveryAddress || order.deliveryAddress || [
+        order.shippingAddress?.street,
+        order.shippingAddress?.city,
+        order.shippingAddress?.state
+    ].filter(Boolean).join(', ')).trim();
+
+    const invoicePayment = entryPayload?.invoicePayment !== undefined
+        ? Number(entryPayload.invoicePayment)
+        : (order.paymentStatus === 'paid' ? 0 : Number(order.totalAmount || 0));
+
+    const pickupAddressCode = entryPayload?.pickupAddressCode || integration?.defaultPickupAddressCode || '';
+    const storeAddressCode = entryPayload?.storeAddressCode || integration?.defaultStoreAddressCode || '';
+
+    return {
+        orderRefNumber: entryPayload?.orderRefNumber || order.orderNumber || String(order._id),
+        orderType: entryPayload?.orderType || 'Normal',
+        cityName,
+        customerName,
+        customerPhone,
+        deliveryAddress,
+        invoicePayment,
+        invoiceDivision: Number(entryPayload?.invoiceDivision) || 1,
+        items: Number(entryPayload?.items) || itemsCount || 1,
+        orderDetail: entryPayload?.orderDetail || itemsDetail || 'Order items',
+        transactionNotes: entryPayload?.transactionNotes || order.transactionNotes || '',
+        ...(pickupAddressCode && { pickupAddressCode }),
+        ...(storeAddressCode && { storeAddressCode })
+    };
+}
+
+function validateBulkPayload(payload) {
+    const missing = [];
+    if (!payload.cityName) missing.push('cityName (select a valid PostEx operational city)');
+    if (!payload.customerName) missing.push('customerName');
+    if (!payload.customerPhone) missing.push('customerPhone');
+    if (!payload.deliveryAddress) missing.push('deliveryAddress');
+    if (!payload.pickupAddressCode) missing.push('pickupAddressCode');
+    if (payload.invoicePayment === undefined || Number.isNaN(payload.invoicePayment)) {
+        missing.push('invoicePayment');
+    }
+    if (!payload.items || Number(payload.items) < 1) missing.push('items');
+    return missing;
+}
 
 const statusMap = {
     'Booked': 'Booked',
@@ -119,7 +203,13 @@ exports.bookOrderOnPostEx = async (req, res) => {
         } catch (logErr) { console.warn('ShipmentLog write error:', logErr.message); }
 
         // ── Call PostEx API ────────────────────────────────────────────────────
-        const response = await postexService.createOrder(payload);
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+        await ensurePostExConfigured(ownerId);
+
+        const response = await postexService.createOrder(ownerId, payload);
 
         // PostEx returns HTTP 200 for BOTH success and failure.
         // The real status lives inside response.statusCode.
@@ -216,13 +306,18 @@ exports.bookOrderOnPostEx = async (req, res) => {
 
 exports.getPostExTracking = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const orderId = req.params.id;
         const order = await Order.findById(orderId);
         if (!order || !order.postex.trackingNumber) {
             return res.status(404).json({ success: false, message: 'Order or tracking number not found' });
         }
 
-        const response = await postexService.trackOrder(order.postex.trackingNumber);
+        const response = await postexService.trackOrder(ownerId, order.postex.trackingNumber);
 
         if (response.dist) {
             order.postex.transactionStatus = response.dist.transactionStatus;
@@ -252,13 +347,18 @@ exports.getPostExTracking = async (req, res) => {
 
 exports.cancelPostExOrder = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const orderId = req.params.id;
         const order = await Order.findById(orderId);
         if (!order || !order.postex.trackingNumber) {
             return res.status(404).json({ success: false, message: 'Order or tracking number not found' });
         }
 
-        const response = await postexService.cancelOrder(order.postex.trackingNumber);
+        const response = await postexService.cancelOrder(ownerId, order.postex.trackingNumber);
 
         order.deliveryStatus = 'Cancelled';
         await order.save();
@@ -278,13 +378,18 @@ exports.cancelPostExOrder = async (req, res) => {
 
 exports.downloadPostExInvoice = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const orderId = req.params.id;
         const order = await Order.findById(orderId);
         if (!order || !order.postex?.trackingNumber) {
             return res.status(404).json({ success: false, message: 'Order or tracking number not found' });
         }
 
-        const response = await postexService.getAirwayBillUrl([order.postex.trackingNumber]);
+        const response = await postexService.getAirwayBillUrl(ownerId, [order.postex.trackingNumber]);
 
         res.status(200).json({ success: true, data: response });
     } catch (error) {
@@ -294,7 +399,13 @@ exports.downloadPostExInvoice = async (req, res) => {
 
 exports.getPostExPickupAddresses = async (req, res) => {
     try {
-        const response = await postexService.getPickupAddresses();
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+        await ensurePostExConfigured(ownerId);
+
+        const response = await postexService.getPickupAddresses(ownerId);
         res.status(200).json({ success: true, data: response });
     } catch (error) {
         res.status(500).json({ success: false, message: error.response?.data?.statusMessage || error.message });
@@ -303,7 +414,13 @@ exports.getPostExPickupAddresses = async (req, res) => {
 
 exports.getPostExOperationalCities = async (req, res) => {
     try {
-        const response = await postexService.getOperationalCities();
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+        await ensurePostExConfigured(ownerId);
+
+        const response = await postexService.getOperationalCities(ownerId);
         res.status(200).json({ success: true, data: response });
     } catch (error) {
         res.status(500).json({ success: false, message: error.response?.data?.statusMessage || error.message });
@@ -312,11 +429,16 @@ exports.getPostExOperationalCities = async (req, res) => {
 
 exports.trackBulk = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const { trackingNumbers } = req.body;
         if (!trackingNumbers || !Array.isArray(trackingNumbers)) {
             return res.status(400).json({ success: false, message: 'Invalid tracking numbers' });
         }
-        const response = await postexService.trackBulkOrders(trackingNumbers);
+        const response = await postexService.trackBulkOrders(ownerId, trackingNumbers);
         res.status(200).json({ success: true, data: response });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -325,6 +447,11 @@ exports.trackBulk = async (req, res) => {
 
 exports.syncTracking = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const orders = await Order.find({
             deliveryStatus: { $nin: ['Delivered', 'Returned', 'Cancelled'] },
             'postex.trackingNumber': { $ne: null }
@@ -333,7 +460,7 @@ exports.syncTracking = async (req, res) => {
         if (!orders.length) return res.status(200).json({ success: true, message: 'No orders to sync' });
 
         const trackingNumbers = orders.map(o => o.postex.trackingNumber);
-        const response = await postexService.trackBulkOrders(trackingNumbers);
+        const response = await postexService.trackBulkOrders(ownerId, trackingNumbers);
 
         // Update each order based on bulk response
         const updates = [];
@@ -380,8 +507,13 @@ exports.syncTracking = async (req, res) => {
 
 exports.saveShipperAdvice = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const { trackingNumber, statusId, remarks } = req.body;
-        const response = await postexService.saveShipperAdvice(trackingNumber, statusId, remarks);
+        const response = await postexService.saveShipperAdvice(ownerId, trackingNumber, statusId, remarks);
         res.status(200).json({ success: true, data: response });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -390,8 +522,13 @@ exports.saveShipperAdvice = async (req, res) => {
 
 exports.getPaymentStatus = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const { trackingNumber } = req.params;
-        const response = await postexService.getPaymentStatus(trackingNumber);
+        const response = await postexService.getPaymentStatus(ownerId, trackingNumber);
         res.status(200).json({ success: true, data: response });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -400,8 +537,13 @@ exports.getPaymentStatus = async (req, res) => {
 
 exports.listPostExOrders = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const { statusId, fromDate, toDate } = req.query;
-        const response = await postexService.listPostExOrders(statusId, fromDate, toDate);
+        const response = await postexService.listOrders(ownerId, { statusId, fromDate, toDate });
         res.status(200).json({ success: true, data: response });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -487,57 +629,129 @@ const applyPostExBookingToOrder = async (order, response, req) => {
 
 exports.bulkBookPostEx = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
+        try {
+            await ensurePostExConfigured(ownerId);
+        } catch (configErr) {
+            return res.status(configErr.status || 400).json({
+                success: false,
+                code: configErr.code || 'POSTEX_NOT_CONFIGURED',
+                message: configErr.message
+            });
+        }
+
+        const integration = await PostExIntegration.findOne({ ownerId, isConnected: true });
         const { shipments, forceRebook, orderIds } = req.body;
 
+        const processShipment = async (entry) => {
+            const orderId = entry.orderId;
+            const entryPayload = entry.payload || {};
+
+            if (!orderId || !mongoose.Types.ObjectId.isValid(orderId)) {
+                return { orderId, status: 'rejected', reason: 'Invalid order ID' };
+            }
+
+            const order = await Order.findById(orderId).populate('items.product', 'title');
+            if (!order) {
+                return { orderId, status: 'rejected', reason: 'Order not found' };
+            }
+            if (order.isPostExBooked && !forceRebook) {
+                return { orderId, status: 'rejected', reason: 'Already booked on PostEx' };
+            }
+            if (order.orderStatus === 'cancelled') {
+                return { orderId, status: 'rejected', reason: 'Order is cancelled' };
+            }
+
+            const payload = buildBulkBookingPayload(order, entryPayload, integration);
+            const missing = validateBulkPayload(payload);
+            if (missing.length) {
+                return {
+                    orderId,
+                    status: 'rejected',
+                    reason: `Missing or invalid fields: ${missing.join(', ')}`
+                };
+            }
+
+            let response;
+            try {
+                response = await postexService.createOrder(ownerId, payload);
+            } catch (apiErr) {
+                return {
+                    orderId,
+                    status: 'rejected',
+                    reason: apiErr.postexResponse?.statusMessage || apiErr.message || 'PostEx API request failed'
+                };
+            }
+
+            if (String(response.statusCode) !== '200') {
+                return {
+                    orderId,
+                    status: 'rejected',
+                    reason: response.statusMessage || response.message || 'PostEx rejected booking',
+                    rawSafeResponse: {
+                        statusCode: response.statusCode,
+                        statusMessage: response.statusMessage || response.message
+                    }
+                };
+            }
+
+            await applyPostExBookingToOrder(order, response, req);
+            const trackingNumber = response.dist?.trackingNumber || response.trackingNumber;
+            return {
+                orderId,
+                status: 'booked',
+                trackingNumber,
+                consignmentNumber: response.dist?.consignmentNumber || null
+            };
+        };
+
         if (shipments && Array.isArray(shipments)) {
+            const results = await Promise.allSettled(shipments.map((entry) => processShipment(entry)));
+
             let successCount = 0;
             const failedOrders = [];
+            const bookedOrders = [];
 
-            for (const entry of shipments) {
-                const orderId = entry.orderId;
-                const payload = entry.payload;
-                try {
-                    const order = await Order.findById(orderId);
-                    if (!order) {
-                        failedOrders.push({ orderId, reason: 'Order not found' });
-                        continue;
+            results.forEach((result, index) => {
+                const orderId = shipments[index]?.orderId;
+                if (result.status === 'fulfilled') {
+                    const value = result.value;
+                    if (value.status === 'booked') {
+                        successCount++;
+                        bookedOrders.push(value);
+                    } else {
+                        failedOrders.push({ orderId: value.orderId, reason: value.reason });
                     }
-                    if (order.isPostExBooked && !forceRebook) {
-                        failedOrders.push({ orderId, reason: 'Already booked on PostEx' });
-                        continue;
-                    }
-                    if (order.orderStatus === 'cancelled') {
-                        failedOrders.push({ orderId, reason: 'Order is cancelled' });
-                        continue;
-                    }
-
-                    const response = await postexService.createOrder(payload);
-                    if (String(response.statusCode) !== '200') {
-                        failedOrders.push({
-                            orderId,
-                            reason: response.statusMessage || response.message || 'PostEx rejected booking',
-                        });
-                        continue;
-                    }
-
-                    await applyPostExBookingToOrder(order, response, req);
-                    successCount++;
-                } catch (e) {
-                    failedOrders.push({ orderId, reason: e.message });
+                } else {
+                    failedOrders.push({
+                        orderId,
+                        reason: result.reason?.message || 'POSTEX_BOOKING_FAILED'
+                    });
                 }
-            }
+            });
 
             return res.status(200).json({
                 success: true,
                 summary: { successCount, failedCount: failedOrders.length },
-                failedOrders,
+                bookedOrders,
+                failedOrders
             });
         }
 
-        const ids = orderIds || [];
+        const ids = (orderIds || []).filter((id) => mongoose.Types.ObjectId.isValid(id));
+        if (!ids.length) {
+            return res.status(400).json({ success: false, code: 'INVALID_ORDER_IDS', message: 'No valid order IDs provided' });
+        }
+
         const orders = await Order.find({ _id: { $in: ids }, isPostExBooked: false, orderStatus: { $ne: 'cancelled' } });
 
         let successCount = 0;
+        const failedOrders = [];
+
         for (const order of orders) {
             try {
                 const customerName = order.customerName || order.shippingAddress?.fullName;
@@ -560,19 +774,30 @@ exports.bulkBookPostEx = async (req, res) => {
                     pickupAddressCode: 'DEFAULT',
                 };
 
-                const response = await postexService.createOrder(payload);
+                const response = await postexService.createOrder(ownerId, payload);
                 if (String(response.statusCode) === '200') {
                     await applyPostExBookingToOrder(order, response, req);
                     successCount++;
+                } else {
+                    failedOrders.push({
+                        orderId: order._id,
+                        reason: response.statusMessage || response.message || 'PostEx rejected booking'
+                    });
                 }
             } catch (e) {
+                failedOrders.push({ orderId: order._id, reason: e.message });
                 console.error(`Bulk booking failed for order ${order._id}:`, e.message);
             }
         }
 
-        res.status(200).json({ success: true, count: successCount });
+        res.status(200).json({
+            success: true,
+            summary: { successCount, failedCount: failedOrders.length },
+            failedOrders
+        });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        console.error('[PostEx] bulkBookPostEx error:', { message: err.message, userId: req.user?._id });
+        res.status(500).json({ success: false, code: 'UNKNOWN_SERVER_ERROR', message: err.message });
     }
 };
 
@@ -590,6 +815,11 @@ exports.getFailedLogs = async (req, res) => {
 
 exports.bulkInvoicePostEx = async (req, res) => {
     try {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+
         const { orderIds } = req.body;
         const orders = await Order.find({ _id: { $in: orderIds }, isPostExBooked: true });
         const trackingNumbers = orders.map(o => o.postex.trackingNumber).filter(Boolean);
@@ -598,7 +828,7 @@ exports.bulkInvoicePostEx = async (req, res) => {
             return res.status(400).json({ success: false, message: 'No booked orders selected' });
         }
 
-        const response = await postexService.getAirwayBillUrl(trackingNumbers);
+        const response = await postexService.getAirwayBillUrl(ownerId, trackingNumbers);
         res.status(200).json({ success: true, data: response });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });

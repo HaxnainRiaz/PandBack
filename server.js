@@ -114,6 +114,42 @@ app.get('/health', (req, res) => {
     });
 });
 
+app.get('/api/config/status', (req, res) => {
+    const uploadConfigured = Boolean(
+        process.env.CLOUDINARY_CLOUD_NAME &&
+        process.env.CLOUDINARY_API_KEY &&
+        (process.env.CLOUDINARY_API_SECRET || process.env.CLOUDINARY_API_SECRE)
+    );
+
+    res.status(200).json({
+        success: true,
+        data: {
+            service: 'backend',
+            nodeEnv: process.env.NODE_ENV || 'development',
+            upload: {
+                provider: process.env.UPLOAD_PROVIDER || 'cloudinary',
+                configured: uploadConfigured
+            },
+            meta: {
+                oauthConfigured: Boolean(process.env.META_APP_ID && process.env.META_APP_SECRET),
+                encryptionConfigured: Boolean(process.env.META_ENCRYPTION_SECRET)
+            },
+            postex: {
+                encryptionConfigured: Boolean(process.env.POSTEX_ENCRYPTION_SECRET)
+            }
+        }
+    });
+});
+
+app.get('/api/health', (req, res) => {
+    res.status(200).json({
+        status: 'ok',
+        service: 'backend',
+        uptime: Math.floor((Date.now() - serverStartedAt) / 1000),
+        timestamp: new Date().toISOString()
+    });
+});
+
 const requireDatabase = async (req, res, next) => {
     try {
         await connectDB();
@@ -131,6 +167,13 @@ const requireDatabase = async (req, res, next) => {
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ limit: '1mb', extended: true }));
+
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads'), {
+    maxAge: '7d',
+    setHeaders: (res) => {
+        res.set('Access-Control-Allow-Origin', '*');
+    }
+}));
 
 app.get('/uploads/:filename', requireDatabase, async (req, res) => {
     try {
@@ -202,7 +245,7 @@ app.use('/api/newsletter', requireDatabase, newsletterRoutes);
 app.use('/api/seo', requireDatabase, seoRoutes);
 app.use('/api/support-tickets', requireDatabase, supportTicketRoutes);
 app.use('/api/blogs', requireDatabase, blogRoutes);
-app.use('/api/upload', requireDatabase, uploadRoutes);
+app.use('/api/upload', uploadRoutes);
 app.use('/api/postex', requireDatabase, postexRoutes);
 app.use('/api/meta', requireDatabase, metaRoutes);
 app.use('/api/store/meta', requireDatabase, publicMetaRoutes);
