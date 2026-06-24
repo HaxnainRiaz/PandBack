@@ -1,7 +1,6 @@
 const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
-const mongoose = require('mongoose');
 const path = require('path');
 const fs = require('fs');
 const compression = require('compression');
@@ -13,8 +12,10 @@ const isProduction = process.env.NODE_ENV === 'production';
 const isVercel = Boolean(process.env.VERCEL);
 const serverStartedAt = Date.now();
 
-dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
-if (!isProduction) {
+if (!isVercel && process.env.FORCE_PUBLIC_DNS === 'true') {
+    dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
+}
+if (!isProduction && process.env.FORCE_PUBLIC_DNS === 'true') {
     console.log('✅ DNS servers configured: Using Google DNS (8.8.8.8) to bypass local DNS issues');
 }
 
@@ -26,6 +27,7 @@ const app = express();
 const allowedOrigins = [
     process.env.CLIENT_URL,
     process.env.FRONTEND_URL,
+    process.env.ADMIN_URL,
     process.env.ADMIN_APP_URL,
     process.env.WEBSTORE_URL,
     process.env.BACKEND_URL,
@@ -37,33 +39,21 @@ const allowedOrigins = [
     'http://127.0.0.1:5000',
     'https://store-pannel.vercel.app',
     'https://store-admin-one.vercel.app',
-    'https://luminelle.org'
+    'https://luminelle.org',
+    'https://pandaemart.com',
+    'https://www.pandaemart.com'
 ].filter(Boolean);
 
-const isLightweightRoute = (path) => path === '/' || path === '/health';
-
-app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (!origin || allowedOrigins.includes(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin || '*');
-    }
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-    res.setHeader('Access-Control-Allow-Headers', 'X-Requested-With, Content-Type, Authorization, Accept');
-
-    if (req.method === 'OPTIONS') return res.status(200).end();
-    next();
-});
+const isAllowedOrigin = (origin) => !origin || allowedOrigins.includes(origin);
 
 app.use(cors({
     origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(null, false);
-        }
+        callback(null, isAllowedOrigin(origin));
     },
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['X-Requested-With', 'Content-Type', 'Authorization', 'Accept'],
+    maxAge: 86400
 }));
 
 app.use((req, res, next) => {
@@ -74,7 +64,8 @@ app.use((req, res, next) => {
             path: req.originalUrl || req.path,
             statusCode: res.statusCode,
             durationMs: Date.now() - start,
-            userAgent: req.get('user-agent') || ''
+            userAgent: req.get('user-agent') || '',
+            error: res.locals.errorMessage || undefined
         }));
     });
     next();
@@ -96,35 +87,25 @@ app.get('/health', (req, res) => {
     });
 });
 
-if (!isProduction && !isVercel) {
-    connectDB().catch(err => console.error('Initial DB Connection Error:', err));
-}
-
-app.use(async (req, res, next) => {
-    if (isLightweightRoute(req.path)) return next();
-
+const requireDatabase = async (req, res, next) => {
     try {
-        if (mongoose.connection.readyState !== 1) {
-            await connectDB();
-        }
-        global.isDbConnected = true;
-        next();
+        await connectDB();
+        return next();
     } catch (error) {
-        global.isDbConnected = false;
-        console.error('Middleware DB Error:', error.message);
-        res.status(500).json({
+        res.locals.errorMessage = error.message;
+        console.error('[MongoDB] Request connection failed:', error.message);
+        return res.status(503).json({
             success: false,
-            message: 'Database connection failed',
-            error: error.message
+            message: 'Database temporarily unavailable'
         });
     }
-});
+};
 
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ limit: '1mb', extended: true }));
 
-app.get('/uploads/:filename', async (req, res) => {
+app.get('/uploads/:filename', requireDatabase, async (req, res) => {
     try {
         const { filename } = req.params;
 
@@ -175,29 +156,31 @@ const postexRoutes = require('./routes/postex');
 const metaRoutes = require('./routes/meta');
 const publicMetaRoutes = require('./routes/publicMeta');
 const trackingRoutes = require('./routes/tracking');
+const storeRoutes = require('./routes/store');
 
-app.use('/api/auth', authRoutes);
-app.use('/api/products', productRoutes);
-app.use('/api/orders', orderRoutes);
-app.use('/api/cms', cmsRoutes);
-app.use('/api/categories', categoryRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/coupons', couponRoutes);
-app.use('/api/reviews', reviewRoutes);
-app.use('/api/stats', statsRoutes);
-app.use('/api/tickets', ticketRoutes);
-app.use('/api/audit', auditRoutes);
-app.use('/api/banners', bannerRoutes);
-app.use('/api/settings', settingsRoutes);
-app.use('/api/newsletter', newsletterRoutes);
-app.use('/api/seo', seoRoutes);
-app.use('/api/support-tickets', supportTicketRoutes);
-app.use('/api/blogs', blogRoutes);
-app.use('/api/upload', uploadRoutes);
-app.use('/api/postex', postexRoutes);
-app.use('/api/meta', metaRoutes);
-app.use('/api/store/meta', publicMetaRoutes);
-app.use('/api/tracking', trackingRoutes);
+app.use('/api/auth', requireDatabase, authRoutes);
+app.use('/api/products', requireDatabase, productRoutes);
+app.use('/api/orders', requireDatabase, orderRoutes);
+app.use('/api/cms', requireDatabase, cmsRoutes);
+app.use('/api/categories', requireDatabase, categoryRoutes);
+app.use('/api/users', requireDatabase, userRoutes);
+app.use('/api/coupons', requireDatabase, couponRoutes);
+app.use('/api/reviews', requireDatabase, reviewRoutes);
+app.use('/api/stats', requireDatabase, statsRoutes);
+app.use('/api/tickets', requireDatabase, ticketRoutes);
+app.use('/api/audit', requireDatabase, auditRoutes);
+app.use('/api/banners', requireDatabase, bannerRoutes);
+app.use('/api/settings', requireDatabase, settingsRoutes);
+app.use('/api/newsletter', requireDatabase, newsletterRoutes);
+app.use('/api/seo', requireDatabase, seoRoutes);
+app.use('/api/support-tickets', requireDatabase, supportTicketRoutes);
+app.use('/api/blogs', requireDatabase, blogRoutes);
+app.use('/api/upload', requireDatabase, uploadRoutes);
+app.use('/api/postex', requireDatabase, postexRoutes);
+app.use('/api/meta', requireDatabase, metaRoutes);
+app.use('/api/store/meta', requireDatabase, publicMetaRoutes);
+app.use('/api/store', requireDatabase, storeRoutes);
+app.use('/api/tracking', requireDatabase, trackingRoutes);
 
 const workersEnabled =
     !isVercel &&
@@ -220,6 +203,7 @@ if (workersEnabled) {
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use((req, res) => {
+    res.locals.errorMessage = 'Route not found';
     res.status(404).json({
         success: false,
         message: `Route not found: ${req.method} ${req.originalUrl}`
@@ -227,10 +211,19 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-    console.error('SERVER ERROR:', err);
-    res.status(err.status || 500).json({
+    const status = err.status || err.statusCode ||
+        (err.name === 'ValidationError' || err.name === 'CastError' ? 400 :
+            err.code === 11000 ? 409 : 500);
+    res.locals.errorMessage = err.message;
+    console.error('SERVER ERROR:', {
+        method: req.method,
+        path: req.originalUrl,
+        status,
+        message: err.message
+    });
+    res.status(status).json({
         success: false,
-        message: err.message || 'Server Error'
+        message: status >= 500 && isProduction ? 'Internal server error' : (err.message || 'Server error')
     });
 });
 

@@ -3,6 +3,7 @@ const Product = require('../models/Product');
 const mongoose = require('mongoose');
 const Category = require('../models/Category');
 const { createLog } = require('./auditController');
+const { getCache, setCache, invalidateCache } = require('../utils/cache');
 
 // ... (keep getProducts and getProduct same)
 
@@ -11,7 +12,7 @@ const { createLog } = require('./auditController');
 // @access  Public
 const PRODUCT_LIST_FIELDS = 'title slug images price salePrice stock category isFeatured isBestSeller status rating totalReviews createdAt';
 
-exports.getProducts = async (req, res) => {
+exports.getProducts = async (req, res, next) => {
     try {
         let isAdmin = false;
         if (req.headers.authorization?.startsWith('Bearer ')) {
@@ -22,24 +23,40 @@ exports.getProducts = async (req, res) => {
             } catch (_) { /* public request */ }
         }
 
-        const page = parseInt(req.query.page) || 1;
-        const limit = Math.min(parseInt(req.query.limit) || 20, isAdmin ? 500 : 200);
+        const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+        const defaultLimit = isAdmin ? 100 : 20;
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || defaultLimit, 1), isAdmin ? 500 : 50);
         const skip = (page - 1) * limit;
 
         const filter = isAdmin ? {} : { status: 'active' };
-        const total = await Product.countDocuments(filter);
-        const products = await Product.find(filter)
+        if (req.query.featured === 'true') filter.isFeatured = true;
+        if (req.query.bestseller === 'true') filter.isBestSeller = true;
+        if (req.query.category && mongoose.Types.ObjectId.isValid(req.query.category)) {
+            filter.category = req.query.category;
+        }
+        if (req.query.search?.trim()) filter.$text = { $search: req.query.search.trim() };
+
+        const cacheKey = `products:list:${JSON.stringify({ page, limit, ...req.query })}`;
+        if (!isAdmin) {
+            const cached = getCache(cacheKey);
+            res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
+            if (cached) return res.status(200).json(cached);
+        }
+
+        const query = Product.find(filter)
             .select(isAdmin ? undefined : PRODUCT_LIST_FIELDS)
             .populate('category', 'title slug')
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit)
+            .maxTimeMS(2500)
             .lean();
+        const [total, products] = await Promise.all([
+            Product.countDocuments(filter).maxTimeMS(2500),
+            query
+        ]);
 
-        if (!isAdmin) {
-            res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
-        }
-        res.status(200).json({
+        const payload = {
             success: true,
             total,
             data: products,
@@ -49,44 +66,58 @@ exports.getProducts = async (req, res) => {
                 pages: Math.ceil(total / limit),
                 limit
             }
-        });
+        };
+        if (!isAdmin) setCache(cacheKey, payload, 60);
+        return res.status(200).json(payload);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        return next(err);
     }
 };
 
 // @desc    Get single product by slug
 // @route   GET /api/products/slug/:slug
 // @access  Public
-exports.getProductBySlug = async (req, res) => {
+exports.getProductBySlug = async (req, res, next) => {
     try {
+        const cacheKey = `products:slug:${req.params.slug}`;
+        const cached = getCache(cacheKey);
+        res.set('Cache-Control', 'public, s-maxage=120, stale-while-revalidate=300');
+        if (cached) return res.status(200).json(cached);
+
         const product = await Product.findOne({ slug: req.params.slug, status: 'active' })
+            .select('-__v')
             .populate('category', 'title slug')
+            .maxTimeMS(2000)
             .lean();
 
         if (!product) {
             return res.status(404).json({ success: false, message: 'Product not found' });
         }
 
-        res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
-        res.status(200).json({ success: true, data: product });
+        const payload = { success: true, data: product };
+        setCache(cacheKey, payload, 120);
+        return res.status(200).json(payload);
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        return next(err);
     }
 };
 
 // @desc    Get single product
 // @route   GET /api/products/:id
 // @access  Public
-exports.getProduct = async (req, res) => {
+exports.getProduct = async (req, res, next) => {
     try {
-        const product = await Product.findById(req.params.id);
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(400).json({ success: false, message: 'Invalid product id' });
+        }
+        const product = await Product.findOne({ _id: req.params.id, status: 'active' })
+            .select('-__v').maxTimeMS(2000).lean();
         if (!product) {
             return res.status(404).json({ success: false, message: 'Product not found' });
         }
         res.status(200).json({ success: true, data: product });
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        return next(err);
     }
 };
 
@@ -138,6 +169,8 @@ exports.createProduct = async (req, res) => {
 
         let product = await Product.create(req.body);
         product = await product.populate('category');
+        invalidateCache('products:');
+        invalidateCache('store:');
 
         // Audit Log
         await createLog(req.user.id, 'Product Creation', `Created product: ${product.title} (${product.slug})`);
@@ -199,6 +232,8 @@ exports.updateProduct = async (req, res) => {
             new: true,
             runValidators: true
         }).populate('category');
+        invalidateCache('products:');
+        invalidateCache('store:');
 
         // Audit Log
         await createLog(req.user.id, 'Product Update', `Updated product: ${product.title}`);
@@ -227,6 +262,8 @@ exports.deleteProduct = async (req, res) => {
 
         const productTitle = product.title;
         await product.deleteOne();
+        invalidateCache('products:');
+        invalidateCache('store:');
 
         // Audit Log
         await createLog(req.user.id, 'Product Deletion', `Deleted product: ${productTitle}`);

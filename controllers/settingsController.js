@@ -1,5 +1,6 @@
 const Settings = require('../models/Settings');
 const { createLog } = require('./auditController');
+const { invalidateCache } = require('../utils/cache');
 
 exports.getSettings = async (req, res) => {
     try {
@@ -23,6 +24,7 @@ exports.updateSettings = async (req, res) => {
         } else {
             settings = await Settings.findOneAndUpdate({}, req.body, { new: true });
         }
+        invalidateCache('store:');
 
         await createLog(req.user.id, 'Settings Update', 'Updated global store structural configuration');
 

@@ -66,6 +66,18 @@ async function testHttpRoutes(port) {
     assert.strictEqual(unknown.body.success, false);
     console.log('  ✓ unknown route returns 404 JSON without redirect');
 
+    const corsOrigin = await new Promise((resolve, reject) => {
+        const req = http.get({
+            host: '127.0.0.1',
+            port,
+            path: '/health',
+            headers: { Origin: 'https://pandaemart.com' }
+        }, (res) => resolve(res.headers['access-control-allow-origin']));
+        req.on('error', reject);
+    });
+    assert.strictEqual(corsOrigin, 'https://pandaemart.com');
+    console.log('  Production webstore origin is allowed by CORS');
+
     const rootHead = await new Promise((resolve, reject) => {
         const req = http.request({
             host: '127.0.0.1',
@@ -80,6 +92,39 @@ async function testHttpRoutes(port) {
     });
     assert.ok(rootHead < 400, 'root should not redirect');
     console.log('  ✓ GET / has no redirect loop');
+}
+
+async function testProductPerformance(port) {
+    const listStart = Date.now();
+    const list = await request(port, '/api/products?limit=12');
+    const listMs = Date.now() - listStart;
+    assert.strictEqual(list.statusCode, 200);
+    assert.strictEqual(list.body.success, true);
+    assert.strictEqual(list.body.pagination.limit, 12);
+    assert.ok(list.body.data.length <= 12, 'product list must honor pagination');
+    assert.ok(listMs < 3000, `product list should respond in <3s (got ${listMs}ms)`);
+    if (list.body.data[0]) {
+        assert.strictEqual(list.body.data[0].description, undefined, 'product cards must omit long descriptions');
+    }
+    console.log(`  Product list is paginated and returned in ${listMs}ms`);
+
+    const catalogStart = Date.now();
+    const catalog = await request(port, '/api/store/catalog?limit=12');
+    const catalogMs = Date.now() - catalogStart;
+    assert.strictEqual(catalog.statusCode, 200);
+    assert.strictEqual(catalog.body.success, true);
+    assert.ok(catalogMs < 3000, `catalog should respond in <3s (got ${catalogMs}ms)`);
+    console.log(`  Store catalog returned in ${catalogMs}ms`);
+
+    const first = list.body.data[0];
+    if (first?.slug) {
+        const detailStart = Date.now();
+        const detail = await request(port, `/api/products/slug/${encodeURIComponent(first.slug)}`);
+        const detailMs = Date.now() - detailStart;
+        assert.strictEqual(detail.statusCode, 200);
+        assert.ok(detailMs < 2000, `product detail should respond in <2s (got ${detailMs}ms)`);
+        console.log(`  Product detail returned in ${detailMs}ms`);
+    }
 }
 
 async function testWorkersDisabledOnVercel() {
@@ -136,10 +181,14 @@ async function run() {
     await new Promise((r) => setTimeout(r, 800));
     await testHttpRoutes(5560);
 
-    console.log('\n[3] Vercel export guard');
+    console.log('\n[3] product API performance');
+    await testProductPerformance(5560);
+
+    console.log('\n[4] Vercel export guard');
     await testWorkersDisabledOnVercel();
 
     console.log('\nAll stability tests passed.');
+    process.exit(0);
 }
 
 run().catch((err) => {

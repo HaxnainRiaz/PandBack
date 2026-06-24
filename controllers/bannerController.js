@@ -1,6 +1,7 @@
 const Banner = require('../models/Banner');
 const { createLog } = require('./auditController');
 const socketUtil = require('../utils/socket');
+const { invalidateCache } = require('../utils/cache');
 
 exports.getBanners = async (req, res) => {
     try {
@@ -15,6 +16,7 @@ exports.getBanners = async (req, res) => {
 exports.createBanner = async (req, res) => {
     try {
         const banner = await Banner.create(req.body);
+        invalidateCache('store:');
         await createLog(req.user.id, 'Banner Creation', `Added new hero banner: ${banner.title}`);
 
         // Emit Socket Event
@@ -31,6 +33,8 @@ exports.createBanner = async (req, res) => {
 exports.updateBanner = async (req, res) => {
     try {
         const banner = await Banner.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        if (!banner) return res.status(404).json({ success: false, message: 'Banner not found' });
+        invalidateCache('store:');
         await createLog(req.user.id, 'Banner Update', `Updated banner: ${banner.title}`);
 
         // Emit Socket Event
@@ -47,6 +51,7 @@ exports.updateBanner = async (req, res) => {
 exports.deleteBanner = async (req, res) => {
     try {
         await Banner.findByIdAndDelete(req.params.id);
+        invalidateCache('store:');
 
         // Emit Socket Event
         try {

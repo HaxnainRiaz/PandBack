@@ -14,7 +14,8 @@
     "restore": "node restoreDatabase.js",
     "reset": "node resetDatabase.js",
     "audit-logs": "node viewAuditLogs.js",
-    "test:stability": "node tests/vercel-stability.test.js"
+    "test:stability": "node tests/vercel-stability.test.js",
+    "db:indexes": "node scripts/create-indexes.js"
   },
   "keywords": [],
   "author": "",

@@ -93,9 +93,10 @@ const productSchema = new mongoose.Schema({
 });
 
 productSchema.index({ status: 1, createdAt: -1 });
-productSchema.index({ isFeatured: 1, status: 1 });
-productSchema.index({ isBestSeller: 1, status: 1 });
-productSchema.index({ category: 1 });
+productSchema.index({ status: 1, category: 1, createdAt: -1 });
+productSchema.index({ status: 1, isFeatured: 1, createdAt: -1 });
+productSchema.index({ status: 1, isBestSeller: 1, createdAt: -1 });
+productSchema.index({ title: 'text', tags: 'text', concerns: 'text' });
 
 // Computed: saleBadge
 productSchema.virtual('saleBadge').get(function () {
