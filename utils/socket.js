@@ -1,10 +1,16 @@
 let io;
 
+const noopEmitter = {
+    emit() {},
+    on() { return this; },
+    to() { return this; }
+};
+
 module.exports = {
     init: (httpServer) => {
         io = require('socket.io')(httpServer, {
             cors: {
-                origin: "*", // Allow all origins for flexibility, or you can restrict to specific domains
+                origin: "*",
                 methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
                 credentials: true
             }
@@ -13,7 +19,7 @@ module.exports = {
     },
     getIO: () => {
         if (!io) {
-            throw new Error("Socket.io not initialized!");
+            return noopEmitter;
         }
         return io;
     }

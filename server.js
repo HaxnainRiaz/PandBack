@@ -7,12 +7,12 @@ const fs = require('fs');
 const compression = require('compression');
 const dns = require('dns');
 
-// Load environment variables
 dotenv.config();
 
 const isProduction = process.env.NODE_ENV === 'production';
+const isVercel = Boolean(process.env.VERCEL);
+const serverStartedAt = Date.now();
 
-// CRITICAL FIX: Force Google DNS to bypass local DNS issues
 dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
 if (!isProduction) {
     console.log('✅ DNS servers configured: Using Google DNS (8.8.8.8) to bypass local DNS issues');
@@ -23,12 +23,11 @@ const Media = require('./models/Media');
 
 const app = express();
 
-/**
- * 1. POWERFUL CORS FAILSAFE (Must be first to handle preflights and errors)
- */
 const allowedOrigins = [
+    process.env.CLIENT_URL,
     process.env.FRONTEND_URL,
     process.env.ADMIN_APP_URL,
+    process.env.WEBSTORE_URL,
     process.env.BACKEND_URL,
     'http://localhost:3000',
     'http://localhost:3001',
@@ -41,9 +40,11 @@ const allowedOrigins = [
     'https://luminelle.org'
 ].filter(Boolean);
 
+const isLightweightRoute = (path) => path === '/' || path === '/health';
+
 app.use((req, res, next) => {
     const origin = req.headers.origin;
-    if (allowedOrigins.includes(origin) || !origin) {
+    if (!origin || allowedOrigins.includes(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin || '*');
     }
     res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -59,20 +60,50 @@ app.use(cors({
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
-            callback(null, true);
+            callback(null, false);
         }
     },
     credentials: true
 }));
 
-// 2. DATABASE CONNECTION (Optimized)
-if (!isProduction) {
+app.use((req, res, next) => {
+    const start = Date.now();
+    res.on('finish', () => {
+        console.log(JSON.stringify({
+            method: req.method,
+            path: req.originalUrl || req.path,
+            statusCode: res.statusCode,
+            durationMs: Date.now() - start,
+            userAgent: req.get('user-agent') || ''
+        }));
+    });
+    next();
+});
+
+app.get('/', (req, res) => {
+    res.status(200).json({
+        message: 'Backend API is running',
+        health: '/health'
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'ok',
+        service: 'backend',
+        uptime: Math.floor((Date.now() - serverStartedAt) / 1000),
+        timestamp: new Date().toISOString()
+    });
+});
+
+if (!isProduction && !isVercel) {
     connectDB().catch(err => console.error('Initial DB Connection Error:', err));
 }
 
 app.use(async (req, res, next) => {
+    if (isLightweightRoute(req.path)) return next();
+
     try {
-        // If not connected, try to connect. connectDB handles caching internally.
         if (mongoose.connection.readyState !== 1) {
             await connectDB();
         }
@@ -89,22 +120,14 @@ app.use(async (req, res, next) => {
     }
 });
 
-/**
- * 3. PERFORMANCE & SECURITY MIDDLEWARE
- */
 app.use(compression());
-app.use(express.json({ limit: '2mb' })); 
-app.use(express.urlencoded({ limit: '2mb', extended: true }));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ limit: '1mb', extended: true }));
 
-/**
- * 4. IMAGE SERVING (CRITICAL FIX)
- * Serves images from both MongoDB and local uploads folder.
- */
 app.get('/uploads/:filename', async (req, res) => {
     try {
         const { filename } = req.params;
 
-        // 1. Try Database First (For Vercel persistence)
         const media = await Media.findOne({ filename });
         if (media && media.data) {
             res.set({
@@ -113,11 +136,10 @@ app.get('/uploads/:filename', async (req, res) => {
                 'Content-Security-Policy': "default-src 'self'",
                 'X-Content-Type-Options': 'nosniff'
             });
-            res.type(media.contentType); // Correctly sets Content-Type without charset
-            return res.send(media.data); // Buffer is sent correctly as binary
+            res.type(media.contentType);
+            return res.send(media.data);
         }
 
-        // 2. Fallback to Local Filesystem
         const localPath = path.join(__dirname, 'public/uploads', filename);
         if (fs.existsSync(localPath)) {
             res.set('Cache-Control', 'public, max-age=86400');
@@ -131,9 +153,6 @@ app.get('/uploads/:filename', async (req, res) => {
     }
 });
 
-/**
- * 5. ROUTES
- */
 const authRoutes = require('./routes/auth');
 const productRoutes = require('./routes/products');
 const orderRoutes = require('./routes/orders');
@@ -180,24 +199,32 @@ app.use('/api/meta', metaRoutes);
 app.use('/api/store/meta', publicMetaRoutes);
 app.use('/api/tracking', trackingRoutes);
 
-// Load Background Jobs (Commented out to prevent overhead)
-// require('./lib/jobs/tracking-sync.job');
+const workersEnabled =
+    !isVercel &&
+    (process.env.ENABLE_WORKERS === 'true' || process.env.ENABLE_TRACKING_WORKER === 'true');
 
-// Conversions API database queue processor background worker (opt-in only)
-if (process.env.ENABLE_TRACKING_WORKER === 'true') {
+if (workersEnabled) {
     const { processPendingQueue } = require('./services/metaQueueService');
-    console.log('🔄 [Meta Queue Worker] Starting background sync process (every 15s)...');
+    console.log('🔄 [Meta Queue Worker] Starting background sync (every 60s, local/long-running only)...');
     setInterval(async () => {
         try {
             await processPendingQueue(25);
         } catch (err) {
             console.error('❌ [Meta Queue Worker Error]:', err.message);
         }
-    }, 15000);
+    }, 60000);
+} else if (isVercel) {
+    console.log('ℹ️ Background workers disabled on Vercel (set ENABLE_WORKERS=true on Railway/Render for queue processing)');
 }
 
-// Static files (must be after /uploads/ route to prioritize DB serving)
 app.use(express.static(path.join(__dirname, 'public')));
+
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        message: `Route not found: ${req.method} ${req.originalUrl}`
+    });
+});
 
 app.use((err, req, res, next) => {
     console.error('SERVER ERROR:', err);
@@ -207,77 +234,70 @@ app.use((err, req, res, next) => {
     });
 });
 
-const http = require('http');
-const socketUtil = require('./utils/socket'); // Import socket util
+let server;
 
-// ... (existing middleware) ...
+if (!isVercel) {
+    const http = require('http');
+    const socketUtil = require('./utils/socket');
 
-// Create HTTP server
-const server = http.createServer(app);
+    server = http.createServer(app);
+    const io = socketUtil.init(server);
 
-// Initialize Socket.io
-const io = socketUtil.init(server);
-
-io.on('connection', (socket) => {
-    socket.on('disconnect', () => {});
-});
-
-const PORT = process.env.PORT || 5000;
-
-/**
- * STARTUP WRAPPER
- * Automatically kills existing process on PORT to prevent EADDRINUSE in dev
- */
-const startServer = (retries = 3) => {
-    if (process.env.NODE_ENV !== 'production') {
-        try {
-            const { execSync } = require('child_process');
-            // Find PIDs specifically in LISTENING state
-            const stdout = execSync(`netstat -ano | findstr :${PORT} | findstr LISTENING`).toString();
-            const pids = new Set();
-
-            stdout.split('\r\n').forEach(line => {
-                const parts = line.trim().split(/\s+/);
-                const pid = parts[parts.length - 1];
-                if (pid && /^\d+$/.test(pid) && pid !== '0' && pid !== process.pid.toString()) {
-                    pids.add(pid);
-                }
-            });
-
-            if (pids.size > 0) {
-                console.log(`[CLEANUP] Force-killing processes on port ${PORT}: ${Array.from(pids).join(', ')}`);
-                pids.forEach(pid => {
-                    try { execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' }); } catch (e) { }
-                });
-                // Small delay to let OS release port
-                const Atomics = require('atomics');
-                const SharedArrayBuffer = require('sharedarraybuffer').SharedArrayBuffer || require('worker_threads').SharedArrayBuffer;
-                if (SharedArrayBuffer) {
-                    const sab = new SharedArrayBuffer(4);
-                    const int32 = new Int32Array(sab);
-                    Atomics.wait(int32, 0, 0, 1000); // 1s sync wait
-                }
-            }
-        } catch (err) { /* No process found */ }
-    }
-
-    server.listen(PORT, () => {
-        console.log(`🚀 Server running on port ${PORT}`);
-    }).on('error', (err) => {
-        if (err.code === 'EADDRINUSE' && retries > 0) {
-            console.log(`[RETRY] Port ${PORT} busy, retrying in 1.5s... (${retries} left)`);
-            setTimeout(() => startServer(retries - 1), 1500);
-        } else {
-            console.error('[FATAL] Server failed to start:', err);
-            process.exit(1);
-        }
+    io.on('connection', (socket) => {
+        socket.on('disconnect', () => {});
     });
-};
 
-startServer();
+    const PORT = process.env.PORT || 5000;
 
-if (process.env.ENABLE_MEMORY_WATCHER === 'true') {
-    require('./scratch/memory_growth_watcher');
+    const startServer = (retries = 3) => {
+        if (process.env.NODE_ENV !== 'production') {
+            try {
+                const { execSync } = require('child_process');
+                const stdout = execSync(`netstat -ano | findstr :${PORT} | findstr LISTENING`).toString();
+                const pids = new Set();
+
+                stdout.split('\r\n').forEach(line => {
+                    const parts = line.trim().split(/\s+/);
+                    const pid = parts[parts.length - 1];
+                    if (pid && /^\d+$/.test(pid) && pid !== '0' && pid !== process.pid.toString()) {
+                        pids.add(pid);
+                    }
+                });
+
+                if (pids.size > 0) {
+                    console.log(`[CLEANUP] Force-killing processes on port ${PORT}: ${Array.from(pids).join(', ')}`);
+                    pids.forEach(pid => {
+                        try { execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' }); } catch (e) { }
+                    });
+                    const Atomics = require('atomics');
+                    const SharedArrayBuffer = require('sharedarraybuffer').SharedArrayBuffer || require('worker_threads').SharedArrayBuffer;
+                    if (SharedArrayBuffer) {
+                        const sab = new SharedArrayBuffer(4);
+                        const int32 = new Int32Array(sab);
+                        Atomics.wait(int32, 0, 0, 1000);
+                    }
+                }
+            } catch (err) { /* No process found */ }
+        }
+
+        server.listen(PORT, () => {
+            console.log(`🚀 Server running on port ${PORT}`);
+        }).on('error', (err) => {
+            if (err.code === 'EADDRINUSE' && retries > 0) {
+                console.log(`[RETRY] Port ${PORT} busy, retrying in 1.5s... (${retries} left)`);
+                setTimeout(() => startServer(retries - 1), 1500);
+            } else {
+                console.error('[FATAL] Server failed to start:', err);
+                process.exit(1);
+            }
+        });
+    };
+
+    startServer();
+
+    if (process.env.ENABLE_MEMORY_WATCHER === 'true') {
+        require('./scratch/memory_growth_watcher');
+    }
 }
 
-module.exports = server; // Export server instead of app
+module.exports = isVercel ? app : server;

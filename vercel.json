@@ -8,12 +8,11 @@
     ],
     "routes": [
         {
-            "src": "/api/(.*)",
-            "dest": "server.js"
-        },
-        {
             "src": "/(.*)",
             "dest": "server.js"
         }
-    ]
+    ],
+    "env": {
+        "ENABLE_WORKERS": "false"
+    }
 }
