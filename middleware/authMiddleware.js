@@ -1,25 +1,33 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { ensureDbConnected, isDbReady } = require('../config/db');
 
-// Protect routes
-exports.protect = async (req, res, next) => {
-    // Top-Level Check: Shield backend if DB is disconnected
-    const mongoose = require('mongoose');
-    if (mongoose.connection.readyState !== 1) {
-        return res.status(503).json({ success: false, message: 'Database temporarily unavailable. Please try again shortly.' });
+async function loadUserWithRetry(userId, maxAttempts = 2) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (!isDbReady()) {
+                await ensureDbConnected(2);
+            }
+            const user = await User.findById(userId).maxTimeMS(12000);
+            return user;
+        } catch (err) {
+            lastError = err;
+            if (attempt < maxAttempts) {
+                await new Promise(r => setTimeout(r, 300));
+            }
+        }
     }
+    throw lastError;
+}
 
+exports.protect = async (req, res, next) => {
     let token;
 
-    if (
-        req.headers.authorization &&
-        req.headers.authorization.startsWith('Bearer')
-    ) {
-        // Set token from Bearer token in header
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
         token = req.headers.authorization.split(' ')[1];
     }
 
-    // Make sure token exists
     if (!token) {
         return res.status(401).json({ success: false, message: 'No token provided' });
     }
@@ -33,7 +41,8 @@ exports.protect = async (req, res, next) => {
     }
 
     try {
-        req.user = await User.findById(decoded.id).maxTimeMS(5000); // 5s timeout
+        await ensureDbConnected(3);
+        req.user = await loadUserWithRetry(decoded.id);
 
         if (!req.user) {
             return res.status(401).json({ success: false, message: 'User not found with this token' });
@@ -46,18 +55,18 @@ exports.protect = async (req, res, next) => {
         next();
     } catch (err) {
         console.error('Database connection or lookup error during auth:', err.message);
-        return res.status(503).json({ success: false, message: 'Database temporarily unavailable. Please try again shortly.' });
+        return res.status(503).json({
+            success: false,
+            message: 'Database temporarily unavailable. Please try again shortly.',
+            retryable: true
+        });
     }
 };
 
-// Optional authentication (for guest checkout)
 exports.optional = async (req, res, next) => {
     let token;
 
-    if (
-        req.headers.authorization &&
-        req.headers.authorization.startsWith('Bearer')
-    ) {
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
         token = req.headers.authorization.split(' ')[1];
     }
 
@@ -67,14 +76,15 @@ exports.optional = async (req, res, next) => {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = await User.findById(decoded.id);
+        if (isDbReady()) {
+            req.user = await User.findById(decoded.id).maxTimeMS(8000);
+        }
     } catch (err) {
-        // Invalid token - proceed as guest
+        // Invalid token or DB unavailable — proceed as guest
     }
     next();
 };
 
-// Grant access to specific roles
 exports.authorize = (...roles) => {
     return (req, res, next) => {
         if (!roles.includes(req.user.role)) {

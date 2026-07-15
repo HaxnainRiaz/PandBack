@@ -52,7 +52,7 @@ const renderOAuthCallbackPage = ({ success, errorCode, message }) => {
 const getSingletonIntegration = async () => {
     const docs = await MetaIntegration.find().sort({ createdAt: -1 });
     if (docs.length === 0) return null;
-    
+
     if (docs.length > 1) {
         console.warn(`[Meta Singleton] Detected ${docs.length} docs. Cleaning up...`);
         const latestId = docs[0]._id;
@@ -65,15 +65,15 @@ const getSingletonIntegration = async () => {
 exports.getMetaStatus = async (req, res) => {
     try {
         res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-        
+
         let integration = await getSingletonIntegration();
-        
+
         const isActuallyConnected = !!(integration && integration.connectionStatus === 'connected');
 
         const integrationActive = Boolean(
-            isActuallyConnected && 
-            integration?.setupCompleted === true && 
-            integration?.pixelId && 
+            isActuallyConnected &&
+            integration?.setupCompleted === true &&
+            integration?.pixelId &&
             integration?.isPixelEnabled
         );
 
@@ -82,7 +82,7 @@ exports.getMetaStatus = async (req, res) => {
         const queuedEvents = await MetaEventLog.countDocuments({ status: 'queued' });
         const sentEvents = await MetaEventLog.countDocuments({ status: { $in: ['sent', 'test_sent'] } });
         const failedEvents = await MetaEventLog.countDocuments({ status: { $in: ['failed', 'dead'] } });
-        const skippedEvents = await MetaEventLog.countDocuments({ status: 'skipped_duplicate' });
+        const skippedEvents = await MetaEventLog.countDocuments({ status: { $in: ['skipped', 'skipped_duplicate'] } });
 
         const statusData = {
             isConnected: isActuallyConnected,
@@ -133,8 +133,8 @@ exports.getMetaStatus = async (req, res) => {
             }
         };
 
-        res.status(200).json({ 
-            success: true, 
+        res.status(200).json({
+            success: true,
             ...statusData,
             data: statusData // For backward compatibility with config = res.data
         });
@@ -256,16 +256,16 @@ exports.oauthCallback = async (req, res) => {
         try {
             const permissionsResponse = await metaService.getGrantedPermissions(tokenData.accessToken);
             // Ensure we handle both raw array and data property
-            const rawPerms = Array.isArray(permissionsResponse) 
-                ? permissionsResponse 
+            const rawPerms = Array.isArray(permissionsResponse)
+                ? permissionsResponse
                 : (permissionsResponse?.data || []);
-            
+
             grantedPermissions = rawPerms
                 .filter(p => p && p.permission)
                 .map(p => ({
                     permission: String(p.permission),
-                    status: p.status === 'declined' ? 'declined' : 
-                            p.status === 'expired' ? 'expired' : 'granted'
+                    status: p.status === 'declined' ? 'declined' :
+                        p.status === 'expired' ? 'expired' : 'granted'
                 }));
         } catch (permissionError) {
             console.warn('Could not fetch Meta permissions:', permissionError.message);
@@ -276,20 +276,20 @@ exports.oauthCallback = async (req, res) => {
         if (!integration) {
             integration = new MetaIntegration();
         }
-        
+
         integration.accessTokenEncrypted = tokenData.accessToken;
         integration.metaUserId = userData.id;
         integration.metaUserName = userData.name;
         integration.metaProfilePicture = userData.picture?.data?.url;
         integration.connectionStatus = 'connected';
         integration.grantedPermissions = grantedPermissions;
-        integration.tokenExpiresAt = tokenData.expiresIn 
+        integration.tokenExpiresAt = tokenData.expiresIn
             ? new Date(Date.now() + tokenData.expiresIn * 1000)
             : null;
         integration.setupStep = 2;
         integration.setupCompleted = false;
         integration.lastErrorMessage = null;
-        
+
         await integration.save();
 
         return res.status(200).send(renderOAuthCallbackPage({ success: true }));
@@ -436,7 +436,8 @@ exports.saveMetaSettings = async (req, res) => {
             setupCompleted = true,
             setupStep = 6,
             pixelId,
-            pixelName
+            pixelName,
+            testEventCode
         } = req.body;
 
         const integration = await getSingletonIntegration();
@@ -486,14 +487,17 @@ exports.saveMetaSettings = async (req, res) => {
 
         const finalEvents = Array.isArray(enabledEvents) && enabledEvents.length > 0
             ? enabledEvents
-            : ['PageView', 'ViewContent', 'Search', 'AddToCart', 'InitiateCheckout', 'Purchase'];
+            : ['PageView', 'ViewContent', 'Search', 'AddToCart', 'InitiateCheckout', 'AddPaymentInfo', 'Purchase'];
 
         integration.isPixelEnabled = Boolean(isPixelEnabled);
         integration.isCapiEnabled = Boolean(isCapiEnabled);
         integration.dataSharingLevel = dataSharingLevel;
         integration.deduplicationEnabled = Boolean(deduplicationEnabled);
         integration.enabledEvents = finalEvents;
-        
+        if (testEventCode !== undefined) {
+            integration.testEventCode = String(testEventCode || '').trim();
+        }
+
         // Hard force setup completion
         integration.setupCompleted = true;
         integration.setupStep = 7;
@@ -603,26 +607,22 @@ exports.testEvent = async (req, res) => {
         } = req.body || {};
 
         const integration = await MetaIntegration.findOne();
-        if (!integration?.pixelId) return res.status(400).json({ success: false, message: 'Pixel ID missing' });
-
-        // Temporarily override testEventCode on the integration or use it
-        const originalTestCode = integration.testEventCode;
-        if (testEventCode !== undefined) {
-            integration.testEventCode = testEventCode;
-            await integration.save();
+        if (!integration?.pixelId) {
+            return res.status(400).json({ success: false, message: 'Pixel ID missing' });
+        }
+        if (!integration?.capiAccessTokenEncrypted && !integration?.accessTokenEncrypted) {
+            return res.status(400).json({ success: false, message: 'CAPI access token not configured' });
         }
 
-        const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || req.ip;
-        let resolvedIp = clientIp;
-        if (resolvedIp && resolvedIp.includes(',')) {
-            resolvedIp = resolvedIp.split(',')[0].trim();
-        }
-        if (resolvedIp === '::1') resolvedIp = '127.0.0.1';
+        const { getClientIp } = require('../utils/getClientIp');
+        const resolvedIp = getClientIp(req);
+
+        const effectiveTestCode = testEventCode || integration.testEventCode || undefined;
 
         const testData = {
             eventName,
             eventId,
-            eventSourceUrl: req.headers.referer || process.env.FRONTEND_URL || process.env.WEBSTORE_URL || 'https://luminelle.org',
+            eventSourceUrl: req.headers.referer || process.env.FRONTEND_URL || process.env.WEBSTORE_URL || 'https://http://localhost:3000',
             userData: {
                 email: userData.email || 'test@example.com',
                 phone: userData.phone || '1234567890',
@@ -630,25 +630,29 @@ exports.testEvent = async (req, res) => {
                 lastName: userData.lastName || 'User',
                 clientIpAddress: userData.clientIpAddress || resolvedIp,
                 clientUserAgent: userData.clientUserAgent || req.headers['user-agent'],
-                fbp: userData.fbp || `fb.1.${Date.now()}.${Math.round(Math.random() * 2147483647)}`,
-                fbc: userData.fbc || null
+                fbp: userData.fbp || undefined,
+                fbc: userData.fbc || undefined
             },
             customData: {
                 ...customData,
-                value: customData.value || 0,
-                currency: customData.currency || 'USD'
-            }
+                value: customData.value ?? 0,
+                currency: customData.currency || 'PKR',
+                content_type: customData.content_type || 'product'
+            },
+            testEventCode: effectiveTestCode
         };
 
         const response = await metaService.sendCapiEvent(integration, testData);
 
-        // Restore original test code if temporary set
-        if (testEventCode !== undefined) {
-            integration.testEventCode = originalTestCode;
-            await integration.save();
-        }
-
-        res.status(200).json({ success: true, data: response, message: 'Test event sent successfully' });
+        res.status(200).json({
+            success: true,
+            data: {
+                ...response,
+                fbtrace_id: response?.fbtrace_id,
+                events_received: response?.events_received
+            },
+            message: 'Test event sent successfully'
+        });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -689,10 +693,10 @@ exports.getBusinesses = async (req, res) => {
         const businesses = await metaService.getBusinesses(integration.accessTokenEncrypted);
         res.status(200).json({ success: true, data: businesses });
     } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            message: error.message, 
-            permissionMissing: error.permissionMissing 
+        res.status(500).json({
+            success: false,
+            message: error.message,
+            permissionMissing: error.permissionMissing
         });
     }
 };
@@ -705,10 +709,10 @@ exports.getAdAccounts = async (req, res) => {
         const accounts = await metaService.getAdAccounts(businessId, integration.accessTokenEncrypted);
         res.status(200).json({ success: true, data: accounts });
     } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            message: error.message, 
-            permissionMissing: error.permissionMissing 
+        res.status(500).json({
+            success: false,
+            message: error.message,
+            permissionMissing: error.permissionMissing
         });
     }
 };
@@ -718,22 +722,22 @@ exports.getPixels = async (req, res) => {
         const { adAccountId, businessId } = req.query;
         const integration = await MetaIntegration.findOne();
         if (!integration?.accessTokenEncrypted) return res.status(400).json({ success: false, message: 'Not connected' });
-        
+
         const bId = businessId || integration.businessId;
         const result = await metaService.getPixels({
             adAccountId,
             businessId: bId,
             accessToken: integration.accessTokenEncrypted
         });
-        
-        res.status(200).json({ 
-            success: true, 
+
+        res.status(200).json({
+            success: true,
             pixels: result.pixels,
-            endpointErrors: result.endpointErrors 
+            endpointErrors: result.endpointErrors
         });
     } catch (error) {
-        res.status(500).json({ 
-            success: false, 
+        res.status(500).json({
+            success: false,
             message: error.message
         });
     }
@@ -757,11 +761,36 @@ exports.getPages = async (req, res) => {
         const pages = await metaService.getPages(integration.accessTokenEncrypted);
         res.status(200).json({ success: true, data: pages });
     } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            message: error.message, 
-            permissionMissing: error.permissionMissing 
+        res.status(500).json({
+            success: false,
+            message: error.message,
+            permissionMissing: error.permissionMissing
         });
+    }
+};
+
+/**
+ * Cron-safe queue processor (Vercel Cron or external scheduler)
+ */
+exports.processQueue = async (req, res) => {
+    try {
+        const cronSecret = process.env.CRON_SECRET || process.env.META_CRON_SECRET;
+        const authHeader = req.headers.authorization;
+        const providedSecret = authHeader?.replace('Bearer ', '') || req.headers['x-cron-secret'];
+
+        // Allow Vercel cron (with secret) or skip auth if no secret configured (dev only)
+        if (cronSecret) {
+            if (providedSecret !== cronSecret) {
+                return res.status(401).json({ success: false, message: 'Unauthorized' });
+            }
+        }
+
+        const { processPendingQueue } = require('../services/metaQueueService');
+        const batchSize = Number(req.query.batch) || 25;
+        const result = await processPendingQueue(batchSize, 'vercel-cron');
+        res.status(200).json({ success: true, data: result });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
     }
 };
 

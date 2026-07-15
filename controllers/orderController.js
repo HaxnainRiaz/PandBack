@@ -7,9 +7,7 @@ const Settings = require('../models/Settings');
 const { createLog } = require('./auditController');
 const { sendPushNotification } = require('../utils/firebase');
 const sendWhatsAppNotification = require('../utils/whatsapp');
-const metaService = require('../services/metaService');
-const metaCapiService = require('../services/metaCapiService');
-const MetaIntegration = require('../models/MetaIntegration');
+const { getClientIp } = require('../utils/getClientIp');
 
 const saveOrderWithUniqueNumber = async (order, maxRetries = 3) => {
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
@@ -140,66 +138,101 @@ exports.addOrderItems = async (req, res) => {
         let finalTotal = itemsTotal + shipping - discountAmount;
         if (finalTotal < 0) finalTotal = 0;
 
-        // 4. Create Order
+        const clientIp = getClientIp(req);
+
+        // 4. Create Order — deterministic Purchase event ID based on order (set after save)
         const order = new Order({
             user: req.user ? req.user._id : null,
             items: calculatedItems,
             shippingAddress,
             customerName: shippingAddress.fullName,
-            totalAmount: finalTotal, // Server calculated total
+            totalAmount: finalTotal,
             shippingFee: shipping,
             coupon: validCouponId,
-            paymentStatus: 'pending', // Will be updated by payment gateway in prod
-            // Meta Tracking Fields
+            paymentStatus: 'pending',
             fbp: req.body.fbp,
             fbc: req.body.fbc,
-            clientIpAddress: req.ip,
-            clientUserAgent: req.headers['user-agent'],
-            metaEventId: req.body.metaEventId || `purchase_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+            clientIpAddress: clientIp,
+            clientUserAgent: req.headers['user-agent']
         });
 
         const createdOrder = await saveOrderWithUniqueNumber(order);
+
+        // Deterministic deduplication event ID: purchase_<orderId>
+        const purchaseEventId = req.body.metaEventId || `purchase_${createdOrder._id}`;
+        if (!createdOrder.metaEventId || createdOrder.metaEventId !== purchaseEventId) {
+            createdOrder.metaEventId = purchaseEventId;
+            await createdOrder.save();
+        }
         console.log(`[Order Created] ID: ${createdOrder._id}, Number: ${createdOrder.orderNumber}`);
 
-        // 5. Meta CAPI Tracking - Queue asynchronously in database
+        // 5. Meta CAPI Purchase — queue and immediately send (critical for Vercel serverless)
         (async () => {
             try {
-                const { queueMetaEvent } = require('../services/metaQueueService');
-                // Determine event_id for deduplication - use what was saved/passed
-                const eventId = createdOrder.metaEventId || `purchase_${createdOrder._id}`;
-                
+                const { queueAndSendMetaEvent } = require('../services/metaQueueService');
+                const MetaEventLog = require('../models/MetaEventLog');
+
+                const existingPurchase = await MetaEventLog.findOne({
+                    eventName: 'Purchase',
+                    eventId: purchaseEventId,
+                    source: 'server',
+                    status: { $in: ['sent', 'test_sent'] }
+                });
+                if (existingPurchase) {
+                    await Order.findByIdAndUpdate(createdOrder._id, {
+                        metaPurchaseCapiSent: true,
+                        metaPurchaseSentAt: existingPurchase.sentAt || new Date()
+                    });
+                    return;
+                }
+
                 const eventDetails = {
                     eventName: 'Purchase',
-                    eventId: eventId,
+                    eventId: purchaseEventId,
                     orderId: createdOrder._id,
-                    eventSourceUrl: req.body.eventSourceUrl || `${process.env.WEBSTORE_URL || 'https://luminelle.org'}/checkout/success`,
+                    eventSourceUrl: req.body.eventSourceUrl || `${process.env.WEBSTORE_URL || 'https://http://localhost:3000'}/checkout`,
                     userData: {
                         email: shippingAddress.email || (req.user ? req.user.email : undefined),
                         phone: shippingAddress.phone,
-                        clientIpAddress: req.ip,
+                        firstName: shippingAddress.fullName?.split(' ')[0],
+                        lastName: shippingAddress.fullName?.split(' ').slice(1).join(' '),
+                        city: shippingAddress.city,
+                        country: shippingAddress.country,
+                        clientIpAddress: clientIp,
                         clientUserAgent: req.headers['user-agent'],
                         fbp: req.body.fbp,
                         fbc: req.body.fbc,
-                        externalId: req.user ? req.user._id.toString() : undefined
+                        externalId: req.user ? req.user._id.toString() : (shippingAddress.email || shippingAddress.phone || createdOrder._id.toString())
                     },
                     customData: {
                         value: finalTotal,
                         currency: 'PKR',
                         content_ids: calculatedItems.map(i => i.product.toString()),
+                        contents: calculatedItems.map(i => ({
+                            id: i.product.toString(),
+                            quantity: i.quantity,
+                            item_price: i.price
+                        })),
                         content_type: 'product',
                         num_items: totalQuantity,
                         order_id: createdOrder.orderNumber || createdOrder._id.toString()
                     }
                 };
 
-                const queueResult = await queueMetaEvent(eventDetails);
-                if (queueResult.success) {
-                    // Mark as queued/sent on order
-                    await Order.findByIdAndUpdate(createdOrder._id, { metaPurchaseCapiSent: true });
-                }
+                const result = await queueAndSendMetaEvent(eventDetails, { lockedBy: 'order-purchase' });
 
+                if (result.sent) {
+                    await Order.findByIdAndUpdate(createdOrder._id, {
+                        metaPurchaseCapiSent: true,
+                        metaPurchaseSentAt: new Date()
+                    });
+                } else if (result.success) {
+                    console.warn(`[Meta CAPI Purchase] Queued for retry. Order: ${createdOrder._id}, logId: ${result.logId}`);
+                } else {
+                    console.error(`[Meta CAPI Purchase] Failed to queue/send. Order: ${createdOrder._id}`, result.error || result.sendResult?.error);
+                }
             } catch (capiErr) {
-                console.error('[Meta CAPI Queue Error during order]:', capiErr.message);
+                console.error('[Meta CAPI Purchase Error during order]:', capiErr.message);
             }
         })();
 
@@ -416,7 +449,7 @@ exports.updateOrderStatus = async (req, res) => {
                 .populate('items.product', 'title images price');
             socketUtil.getIO().emit('order:update', populatedOrder);
             return res.status(200).json({ success: true, data: populatedOrder });
-        } catch (e) { 
+        } catch (e) {
             console.error('Socket Emit Error:', e);
             return res.status(200).json({ success: true, data: updatedOrder });
         }
@@ -492,7 +525,7 @@ const IMMUTABLE_ORDER_FIELDS = ['_id', 'id', 'orderNumber', 'orderId', 'createdA
 exports.updateOrderDetails = async (req, res) => {
     try {
         const { id } = req.params;
-        
+
         // 1. Sanitize payload to prevent identity theft/modification
         const updatePayload = { ...req.body };
         IMMUTABLE_ORDER_FIELDS.forEach(field => delete updatePayload[field]);
@@ -541,7 +574,7 @@ exports.updateOrderDetails = async (req, res) => {
                 .populate('items.product', 'title images price');
             socketUtil.getIO().emit('order:update', populatedOrder);
             return res.status(200).json({ success: true, data: populatedOrder });
-        } catch (e) { 
+        } catch (e) {
             return res.status(200).json({ success: true, data: updatedOrder });
         }
     } catch (err) {

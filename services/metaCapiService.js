@@ -94,15 +94,20 @@ exports.sendMetaCapiEvent = async (eventName, eventData) => {
             params: { access_token: accessToken }
         });
 
-        // 5. Log Success
+        const eventsReceived = Number(response.data?.events_received ?? 0);
+        if (eventsReceived < 1) {
+            return { success: false, message: 'Meta did not confirm event receipt (events_received < 1)' };
+        }
+
         await MetaEventLog.create({
             orderId: orderId || null,
             eventName,
             eventId,
             pixelId: integration.pixelId,
             source: 'server',
-            status: 'success',
-            metaResponse: response.data,
+            status: testEventCode ? 'test_sent' : 'sent',
+            responsePayloadSafe: response.data,
+            fbtraceId: response.data?.fbtrace_id,
             requestPayloadSafe: {
                 ...payload.data[0],
                 user_data: {

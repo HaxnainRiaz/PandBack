@@ -5,6 +5,7 @@ const { protect, authorize } = require('../middleware/authMiddleware');
 
 // Public/Meta-facing routes (NO AUTH)
 router.get('/oauth/callback', metaController.oauthCallback);
+router.post('/events/process-queue', metaController.processQueue);
 
 // Protected Admin routes
 router.use(protect);
@@ -22,6 +23,11 @@ router.get('/event-logs', metaController.getEventLogs);
 router.post('/test-event', metaController.testEvent);
 router.post('/disconnect', metaController.disconnectMeta);
 
+// Queue Processing & Retrying (admin)
+router.post('/process-pending', metaController.processPending);
+router.post('/retry/:logId', metaController.retryLog);
+router.post('/retry-all', metaController.retryAll);
+
 // Asset Management
 router.get('/businesses', metaController.getBusinesses);
 router.get('/ad-accounts/:businessId', metaController.getAdAccounts);
@@ -33,10 +39,5 @@ router.post('/select-business', metaController.selectBusiness);
 router.post('/select-ad-account', metaController.selectAdAccount);
 router.post('/select-pixel', metaController.selectPixel);
 router.post('/select-page', metaController.selectPage);
-
-// Queue Processing & Retrying
-router.post('/process-pending', metaController.processPending);
-router.post('/retry/:logId', metaController.retryLog);
-router.post('/retry-all', metaController.retryAll);
 
 module.exports = router;

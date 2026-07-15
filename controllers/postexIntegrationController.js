@@ -64,6 +64,11 @@ exports.connect = async (req, res) => {
         const encrypted = encryptPostExToken(plain);
         const masked = maskToken(plain);
 
+        const addresses = verifyResult?.dist || [];
+        const { pickFirstAddressCode } = require('../utils/postexBooking');
+        const autoPickup = pickFirstAddressCode(addresses, 'pickup');
+        const autoStore = pickFirstAddressCode(addresses, 'store');
+
         const integration = await PostExIntegration.findOneAndUpdate(
             { ownerId: req.user._id },
             {
@@ -73,7 +78,9 @@ exports.connect = async (req, res) => {
                 apiTokenEncrypted: encrypted,
                 apiTokenMasked: masked,
                 lastVerifiedAt: new Date(),
-                lastErrorMessage: null
+                lastErrorMessage: null,
+                ...(autoPickup && { defaultPickupAddressCode: autoPickup }),
+                ...(autoStore && { defaultStoreAddressCode: autoStore })
             },
             { upsert: true, new: true }
         );

@@ -151,6 +151,7 @@ const orderSchema = new mongoose.Schema({
     metaEventId: { type: String },
     metaPurchasePixelSent: { type: Boolean, default: false },
     metaPurchaseCapiSent: { type: Boolean, default: false },
+    metaPurchaseSentAt: { type: Date },
     fbp: { type: String },
     fbc: { type: String },
     clientIpAddress: { type: String },

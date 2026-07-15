@@ -158,18 +158,20 @@ exports.getOrderTypes = async (ownerId) => {
 
 exports.createOrder = async (ownerId, payload) => {
     const token = await resolveToken(ownerId);
-    try {
-        const res = await axios.post(
-            `${BASE}/v3/create-order`,
-            payload,
-            { headers: buildHeaders(token), timeout: 15000, validateStatus: () => true }
-        );
-        return normalise(res);
-    } catch (err) {
-        const body = extractPostExErrorBody(err);
-        if (body) return body;
-        throw formatPostExAxiosError(err);
-    }
+    return withRetry(async () => {
+        try {
+            const res = await axios.post(
+                `${BASE}/v3/create-order`,
+                payload,
+                { headers: buildHeaders(token), timeout: 20000, validateStatus: () => true }
+            );
+            return normalise(res);
+        } catch (err) {
+            const body = extractPostExErrorBody(err);
+            if (body) return body;
+            throw formatPostExAxiosError(err);
+        }
+    }, 2, 800);
 };
 
 exports.trackOrder = async (ownerId, trackingNumber) => {

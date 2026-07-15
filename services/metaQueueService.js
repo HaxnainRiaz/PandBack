@@ -7,20 +7,22 @@ const { hashField } = require('../utils/hash');
 const GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || 'v21.0';
 const GRAPH_API_BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
-// Throttle: only log "no integration" warning once every 5 minutes to reduce terminal noise
 let _lastNoIntegrationLogTime = 0;
 const NO_INTEGRATION_LOG_INTERVAL_MS = 5 * 60 * 1000;
 
+const normalizeStatus = (status) => {
+    const map = { success: 'sent', error: 'failed', pending: 'queued' };
+    return map[status] || status;
+};
+
 /**
  * Normalizes, hashes and prepares user data for storage & Meta transmission.
- * Crucial: Only stores pre-hashed PII inside the DB.
  */
 const prepareUserData = (rawUserData) => {
     if (!rawUserData) return {};
 
     const userData = {};
 
-    // 1. Process standard fields (hashes only)
     if (rawUserData.email) {
         userData.em = [hashField(rawUserData.email, 'email')];
     } else if (rawUserData.em) {
@@ -49,13 +51,28 @@ const prepareUserData = (rawUserData) => {
         userData.ln = Array.isArray(rawUserData.ln) ? rawUserData.ln : [rawUserData.ln];
     }
 
+    if (rawUserData.city) {
+        userData.ct = [hashField(rawUserData.city, 'string')];
+    } else if (rawUserData.ct) {
+        userData.ct = Array.isArray(rawUserData.ct) ? rawUserData.ct : [rawUserData.ct];
+    }
+
+    if (rawUserData.country) {
+        userData.country = [hashField(rawUserData.country, 'string')];
+    }
+
+    if (rawUserData.postalCode || rawUserData.zip) {
+        userData.zp = [hashField(rawUserData.postalCode || rawUserData.zip, 'string')];
+    } else if (rawUserData.zp) {
+        userData.zp = Array.isArray(rawUserData.zp) ? rawUserData.zp : [rawUserData.zp];
+    }
+
     if (rawUserData.externalId) {
         userData.external_id = [hashField(rawUserData.externalId, 'raw')];
     } else if (rawUserData.external_id) {
         userData.external_id = Array.isArray(rawUserData.external_id) ? rawUserData.external_id : [rawUserData.external_id];
     }
 
-    // 2. Client context fields (non-PII, pass directly)
     if (rawUserData.client_ip_address) userData.client_ip_address = rawUserData.client_ip_address;
     if (rawUserData.clientIpAddress) userData.client_ip_address = rawUserData.clientIpAddress;
 
@@ -65,14 +82,104 @@ const prepareUserData = (rawUserData) => {
     if (rawUserData.fbp) userData.fbp = rawUserData.fbp;
     if (rawUserData.fbc) userData.fbc = rawUserData.fbc;
 
-    // Filter out undefined/null properties
     return Object.fromEntries(
         Object.entries(userData).filter(([_, v]) => v !== undefined && v !== null)
     );
 };
 
+const getAccessToken = async (integration) => {
+    let accessToken = integration.capiAccessTokenEncrypted || integration.accessTokenEncrypted;
+    if (!accessToken) {
+        throw new Error('Access token missing or cleared');
+    }
+    if (accessToken.includes(':')) {
+        accessToken = decryptToken(accessToken);
+    }
+    return accessToken;
+};
+
 /**
- * Pushes a tracking event into the DB-backed Conversions API queue
+ * Sends a prepared CAPI payload to Meta Graph API.
+ * Returns success only when events_received >= 1.
+ */
+const sendPayloadToMeta = async (integration, requestPayloadSafe, options = {}) => {
+    const { testEventCode, timeout = 5000 } = options;
+    const accessToken = await getAccessToken(integration);
+
+    const capiPayload = { data: [requestPayloadSafe] };
+    if (testEventCode) {
+        capiPayload.test_event_code = testEventCode;
+    }
+
+    const startTime = Date.now();
+    const response = await axios.post(
+        `${GRAPH_API_BASE_URL}/${integration.pixelId}/events`,
+        capiPayload,
+        {
+            params: { access_token: accessToken },
+            headers: { 'Content-Type': 'application/json' },
+            timeout
+        }
+    );
+
+    const responseTimeMs = Date.now() - startTime;
+    const eventsReceived = Number(response.data?.events_received ?? 0);
+    const fbtraceId = response.data?.fbtrace_id || null;
+
+    return {
+        success: eventsReceived >= 1,
+        eventsReceived,
+        fbtraceId,
+        response: response.data,
+        responseTimeMs
+    };
+};
+
+const applySendResultToLog = (eventLog, result, testCode) => {
+    eventLog.responseTimeMs = result.responseTimeMs;
+    eventLog.responsePayloadSafe = result.response;
+    eventLog.fbtraceId = result.fbtraceId;
+
+    if (result.success) {
+        eventLog.status = testCode ? 'test_sent' : 'sent';
+        eventLog.sentAt = new Date();
+        eventLog.errorMessage = null;
+        eventLog.lockedAt = null;
+        eventLog.lockedBy = null;
+        return true;
+    }
+
+    eventLog.errorMessage = 'Meta did not confirm event receipt (events_received < 1)';
+    return false;
+};
+
+const applySendErrorToLog = (eventLog, error) => {
+    const errData = error.response?.data?.error;
+    const errMsg = errData?.message || error.message;
+    eventLog.errorMessage = errMsg;
+    eventLog.responsePayloadSafe = error.response?.data || null;
+    eventLog.fbtraceId = error.response?.data?.fbtrace_id || null;
+
+    const isClientError = error.response?.status >= 400 && error.response?.status < 500;
+    const isDeadToken = errData?.code === 190 || errData?.code === 102;
+
+    if (isClientError && !isDeadToken) {
+        eventLog.status = 'dead';
+    } else if (eventLog.attempts >= eventLog.maxAttempts) {
+        eventLog.status = 'failed';
+    } else {
+        eventLog.status = 'failed';
+        const backoffMinutes = Math.pow(2, eventLog.attempts);
+        eventLog.nextRetryAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
+    }
+
+    eventLog.lockedAt = null;
+    eventLog.lockedBy = null;
+    return { errMsg, isDeadToken };
+};
+
+/**
+ * Pushes a tracking event into the DB-backed Conversions API queue.
  */
 const queueMetaEvent = async (eventDetails) => {
     const startTime = Date.now();
@@ -84,29 +191,49 @@ const queueMetaEvent = async (eventDetails) => {
             eventTime = Math.floor(Date.now() / 1000),
             eventSourceUrl,
             userData: rawUserData = {},
-            customData = {}
+            customData = {},
+            testEventCode
         } = eventDetails;
 
         if (!eventName || !eventId) {
-            console.error('[Meta Queue] Missing required eventName or eventId');
             return { success: false, error: 'eventName and eventId are required' };
         }
 
-        // 1. Fetch integration to see if Pixel/CAPI is enabled and get Pixel ID
         const integration = await MetaIntegration.findOne();
         if (!integration) {
             return { success: false, error: 'Meta integration not configured' };
         }
 
-        // 2. Prepare safe, pre-hashed payload
-        const user_data = prepareUserData(rawUserData);
+        if (!integration.pixelId) {
+            return { success: false, error: 'Pixel ID not configured' };
+        }
 
+        if (!integration.isCapiEnabled) {
+            const skippedLog = await MetaEventLog.findOneAndUpdate(
+                { eventName, eventId, source: 'server' },
+                {
+                    $setOnInsert: {
+                        orderId: orderId || null,
+                        pixelId: integration.pixelId,
+                        deduplicationKey: `${eventName}:${eventId}`
+                    },
+                    $set: {
+                        status: 'skipped',
+                        errorMessage: 'CAPI is disabled in settings'
+                    }
+                },
+                { upsert: true, new: true }
+            );
+            return { success: false, error: 'CAPI disabled', logId: skippedLog._id, skipped: true };
+        }
+
+        const user_data = prepareUserData(rawUserData);
         const requestPayloadSafe = {
             event_name: eventName,
             event_time: eventTime,
             event_id: eventId,
             action_source: 'website',
-            event_source_url: eventSourceUrl || process.env.WEBSTORE_URL || 'https://luminelle.org',
+            event_source_url: eventSourceUrl || process.env.WEBSTORE_URL || 'https://http://localhost:3000',
             user_data,
             custom_data: {
                 ...customData,
@@ -114,19 +241,23 @@ const queueMetaEvent = async (eventDetails) => {
             }
         };
 
-        // Determine indicators
         const hasFbp = !!user_data.fbp;
         const hasFbc = !!user_data.fbc;
         const hasEmailHash = !!(user_data.em && user_data.em.length > 0);
         const hasPhoneHash = !!(user_data.ph && user_data.ph.length > 0);
         const hasExternalId = !!(user_data.external_id && user_data.external_id.length > 0);
-        const testEventCodeUsed = integration.testEventCode || '';
+        const testEventCodeUsed = testEventCode || '';
 
-        // Deduplication key representation
-        const deduplicationKey = `${eventName}:${eventId}`;
+        const existingSent = await MetaEventLog.findOne({
+            eventName,
+            eventId,
+            source: 'server',
+            status: { $in: ['sent', 'test_sent', 'deduplicated'] }
+        });
+        if (existingSent) {
+            return { success: true, logId: existingSent._id, deduplicated: true, durationMs: Date.now() - startTime };
+        }
 
-        // 3. Create or update queued Meta event log
-        // Use findOneAndUpdate with upsert to prevent unique key violations from parallel client calls
         const log = await MetaEventLog.findOneAndUpdate(
             { eventName, eventId, source: 'server' },
             {
@@ -140,22 +271,20 @@ const queueMetaEvent = async (eventDetails) => {
                     hasEmailHash,
                     hasPhoneHash,
                     hasExternalId,
-                    deduplicationKey,
+                    deduplicationKey: `${eventName}:${eventId}`,
                     testEventCodeUsed
                 },
                 $set: {
                     status: 'queued',
                     nextRetryAt: new Date(),
-                    requestPayloadSafe
+                    requestPayloadSafe,
+                    testEventCodeUsed
                 }
             },
             { upsert: true, new: true }
         );
 
-        const duration = Date.now() - startTime;
-        console.log(`[Meta Queue] Queued server event ${eventName} (ID: ${eventId}) in ${duration}ms`);
-        return { success: true, logId: log._id, durationMs: duration };
-
+        return { success: true, logId: log._id, durationMs: Date.now() - startTime };
     } catch (error) {
         console.error('[Meta Queue] Error in queueMetaEvent:', error.message);
         return { success: false, error: error.message };
@@ -163,193 +292,173 @@ const queueMetaEvent = async (eventDetails) => {
 };
 
 /**
- * Background worker/batch processor for queued database records.
- * Incorporates: Serverless execution guard, Axios payloads, and Exponential backoff retry.
+ * Immediately sends a single queued event log to Meta.
  */
-const processPendingQueue = async (batchSize = 20) => {
+const sendEventLogImmediately = async (logId, lockedBy = 'immediate') => {
+    const eventLog = await MetaEventLog.findById(logId);
+    if (!eventLog) {
+        return { success: false, error: 'Event log not found' };
+    }
+
+    if (['sent', 'test_sent', 'deduplicated', 'skipped'].includes(eventLog.status)) {
+        return { success: true, status: eventLog.status, alreadySent: true };
+    }
+
+    if (eventLog.status === 'processing' && eventLog.lockedAt && (Date.now() - eventLog.lockedAt.getTime()) < 30000) {
+        return { success: false, error: 'Event is currently being processed' };
+    }
+
+    const integration = await MetaIntegration.findOne();
+    if (!integration || !integration.pixelId || !integration.isCapiEnabled) {
+        return { success: false, error: 'CAPI not configured or disabled' };
+    }
+
+    eventLog.status = 'processing';
+    eventLog.lockedAt = new Date();
+    eventLog.lockedBy = lockedBy;
+    eventLog.lastAttemptAt = new Date();
+    eventLog.attempts += 1;
+    await eventLog.save();
+
+    const testCode = eventLog.testEventCodeUsed || null;
+
+    try {
+        const result = await sendPayloadToMeta(integration, eventLog.requestPayloadSafe, { testEventCode: testCode || undefined });
+
+        if (applySendResultToLog(eventLog, result, testCode)) {
+            integration.lastSuccessfulCapiAt = new Date();
+            integration.lastEventSentAt = new Date();
+            integration.lastErrorMessage = null;
+            integration.connectionStatus = 'connected';
+            await integration.save();
+        } else {
+            if (eventLog.attempts >= eventLog.maxAttempts) {
+                eventLog.status = 'failed';
+            } else {
+                eventLog.status = 'queued';
+                const backoffMinutes = Math.pow(2, eventLog.attempts);
+                eventLog.nextRetryAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
+            }
+        }
+    } catch (error) {
+        const { errMsg, isDeadToken } = applySendErrorToLog(eventLog, error);
+        if (isDeadToken) {
+            integration.connectionStatus = 'error';
+            integration.lastErrorMessage = errMsg;
+            await integration.save();
+        }
+        await eventLog.save();
+        return { success: false, error: errMsg, status: eventLog.status };
+    }
+
+    await eventLog.save();
+    const isSuccess = eventLog.status === 'sent' || eventLog.status === 'test_sent';
+    return {
+        success: isSuccess,
+        status: eventLog.status,
+        fbtraceId: eventLog.fbtraceId,
+        eventsReceived: eventLog.responsePayloadSafe?.events_received
+    };
+};
+
+/**
+ * Queues an event and immediately attempts delivery (critical for Purchase on Vercel).
+ */
+const queueAndSendMetaEvent = async (eventDetails, options = {}) => {
+    const queueResult = await queueMetaEvent(eventDetails);
+    if (!queueResult.success) {
+        return { ...queueResult, sent: false };
+    }
+    if (queueResult.deduplicated) {
+        return { ...queueResult, sent: true, deduplicated: true };
+    }
+
+    const sendResult = await sendEventLogImmediately(queueResult.logId, options.lockedBy || 'immediate');
+    return {
+        ...queueResult,
+        sent: sendResult.success,
+        sendResult
+    };
+};
+
+/**
+ * Background batch processor for queued database records.
+ */
+const processPendingQueue = async (batchSize = 20, lockedBy = 'queue-worker') => {
     const queueStartTime = Date.now();
-    const TIMEOUT_LIMIT_MS = 8000; // Early exit after 8 seconds to prevent serverless gateway timeouts
+    const TIMEOUT_LIMIT_MS = 8000;
 
     const mongoose = require('mongoose');
     if (mongoose.connection.readyState !== 1) {
-        console.warn('[Meta Queue Worker] DB unavailable. Meta Queue Worker paused.');
         return { processed: 0, status: 'db_unavailable' };
     }
 
-    console.log(`[Meta Queue Worker] Starting pending queue processor. Batch size limit: ${batchSize}`);
-
-    // 1. Fetch integration and check if connected
     const integration = await MetaIntegration.findOne();
     if (!integration || !integration.pixelId) {
         const now = Date.now();
         if (now - _lastNoIntegrationLogTime >= NO_INTEGRATION_LOG_INTERVAL_MS) {
-            console.warn('[Meta Queue Worker] No Meta Integration or Pixel ID found. Worker aborted. (This message is throttled to once per 5 min)');
             _lastNoIntegrationLogTime = now;
         }
         return { processed: 0, status: 'no_integration' };
     }
 
     if (!integration.isCapiEnabled) {
-        console.warn('[Meta Queue Worker] Conversions API is disabled in settings. Worker skipped.');
         return { processed: 0, status: 'capi_disabled' };
     }
 
-    // 2. Decrypt token
-    let accessToken = integration.capiAccessTokenEncrypted || integration.accessTokenEncrypted;
-    if (!accessToken) {
-        console.error('[Meta Queue Worker] Meta API token missing. Connection status set to error.');
+    try {
+        await getAccessToken(integration);
+    } catch (tokenErr) {
         integration.connectionStatus = 'error';
-        integration.lastErrorMessage = 'Access token missing or cleared';
+        integration.lastErrorMessage = tokenErr.message;
         await integration.save();
         return { processed: 0, status: 'token_error' };
     }
 
-    if (accessToken.includes(':')) {
-        try {
-            accessToken = decryptToken(accessToken);
-        } catch (decErr) {
-            console.error('[Meta Queue Worker] Failed to decrypt access token:', decErr.message);
-            integration.connectionStatus = 'error';
-            integration.lastErrorMessage = `Token decryption failed: ${decErr.message}`;
-            await integration.save();
-            return { processed: 0, status: 'decryption_error' };
-        }
-    }
-
-    // 3. Find pending events to process
     const pendingEvents = await MetaEventLog.find({
         source: 'server',
         status: { $in: ['queued', 'failed'] },
-        attempts: { $lt: 3 }, // Attempts less than maxAttempts (3)
-        nextRetryAt: { $lte: new Date() }
+        attempts: { $lt: 3 },
+        nextRetryAt: { $lte: new Date() },
+        $or: [
+            { lockedAt: null },
+            { lockedAt: { $lt: new Date(Date.now() - 60000) } }
+        ]
     })
-    .sort({ createdAt: -1 })
-    .limit(batchSize);
+        .sort({ createdAt: 1 })
+        .limit(batchSize);
 
     if (pendingEvents.length === 0) {
-        console.log('[Meta Queue Worker] No pending events to process.');
         return { processed: 0, status: 'idle' };
     }
-
-    console.log(`[Meta Queue Worker] Found ${pendingEvents.length} pending events to send to Meta.`);
 
     let processedCount = 0;
     let successCount = 0;
     let failedCount = 0;
 
     for (const eventLog of pendingEvents) {
-        // Early serverless timeout escape check
-        const elapsed = Date.now() - queueStartTime;
-        if (elapsed > TIMEOUT_LIMIT_MS) {
-            console.warn(`[Meta Queue Worker] Approaching 8s serverless limit (${elapsed}ms). Saving batch and exiting early.`);
-            break;
-        }
+        if (Date.now() - queueStartTime > TIMEOUT_LIMIT_MS) break;
 
-        const startItemTime = Date.now();
-        eventLog.attempts += 1;
-
-        try {
-            // Build the payload Meta expects
-            const capiPayload = {
-                data: [eventLog.requestPayloadSafe]
-            };
-
-            // Inject test code if set in event or globally
-            const testCode = eventLog.testEventCodeUsed || integration.testEventCode;
-            if (testCode) {
-                capiPayload.test_event_code = testCode;
-            }
-
-            // Fire API call
-            const response = await axios.post(
-                `${GRAPH_API_BASE_URL}/${integration.pixelId}/events`,
-                capiPayload,
-                {
-                    params: { access_token: accessToken },
-                    headers: { 'Content-Type': 'application/json' },
-                    timeout: 5000 // 5 seconds individual timeout
-                }
-            );
-
-            const duration = Date.now() - startItemTime;
-
-            // Success
-            eventLog.status = testCode ? 'test_sent' : 'sent';
-            eventLog.sentAt = new Date();
-            eventLog.responseTimeMs = duration;
-            eventLog.responsePayloadSafe = response.data;
-            eventLog.errorMessage = null;
-
-            successCount++;
-            
-            // Track health metrics
-            integration.lastSuccessfulCapiAt = new Date();
-            integration.lastEventSentAt = new Date();
-            integration.lastErrorMessage = null;
-            integration.connectionStatus = 'connected';
-
-        } catch (error) {
-            const duration = Date.now() - startItemTime;
-            eventLog.responseTimeMs = duration;
-            
-            const errData = error.response?.data?.error;
-            const errMsg = errData?.message || error.message;
-            eventLog.errorMessage = errMsg;
-            eventLog.responsePayloadSafe = error.response?.data || null;
-
-            console.error(`[Meta Queue Worker] Event transmission failed for log ${eventLog._id}:`, errMsg);
-
-            // Check if error is non-retryable (400 Client error in payload/invalid token/etc.)
-            const isClientError = error.response?.status >= 400 && error.response?.status < 500;
-            const isDeadToken = errData?.code === 190 || errData?.code === 102; // Invalid OAuth 2.0 access token
-
-            if (isClientError && !isDeadToken) {
-                // If it is a bad payload issue (e.g. invalid parameters), mark it dead immediately to avoid wasting resource retrying
-                eventLog.status = 'dead';
-                failedCount++;
-            } else {
-                // Retryable error (server down, timeout, network error, or invalid token which might get fixed)
-                eventLog.status = 'failed';
-                
-                if (eventLog.attempts >= eventLog.maxAttempts) {
-                    eventLog.status = 'dead';
-                    failedCount++;
-                } else {
-                    // Exponential backoff: retry after 2 minutes, 4 minutes, etc.
-                    const backoffMinutes = Math.pow(2, eventLog.attempts);
-                    eventLog.nextRetryAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
-                }
-            }
-
-            integration.lastErrorMessage = errMsg;
-            if (isDeadToken) {
-                integration.connectionStatus = 'error';
-            }
-        }
-
-        // Save log updates immediately
-        await eventLog.save();
+        const sendResult = await sendEventLogImmediately(eventLog._id, lockedBy);
         processedCount++;
+        if (sendResult.success) {
+            successCount++;
+        } else {
+            failedCount++;
+        }
     }
 
-    // Refresh integration metrics and health score
     try {
-        // Simple health score formula: (successCount / processedCount) * 100
         const totalLogs = await MetaEventLog.countDocuments({ source: 'server' });
-        const failedLogs = await MetaEventLog.countDocuments({ source: 'server', status: 'dead' });
-        
-        let healthScore = 100;
-        if (totalLogs > 0) {
-            healthScore = Math.max(0, Math.round(((totalLogs - failedLogs) / totalLogs) * 100));
-        }
-        
-        integration.trackingHealthScore = healthScore;
+        const failedLogs = await MetaEventLog.countDocuments({ source: 'server', status: { $in: ['failed', 'dead'] } });
+        integration.trackingHealthScore = totalLogs > 0
+            ? Math.max(0, Math.round(((totalLogs - failedLogs) / totalLogs) * 100))
+            : 100;
         await integration.save();
     } catch (saveErr) {
         console.error('[Meta Queue Worker] Failed to update health score:', saveErr.message);
     }
 
-    console.log(`[Meta Queue Worker] Batch finished. Processed: ${processedCount}, Success: ${successCount}, Failures/Dead: ${failedCount} in ${Date.now() - queueStartTime}ms`);
     return {
         processed: processedCount,
         success: successCount,
@@ -359,6 +468,12 @@ const processPendingQueue = async (batchSize = 20) => {
 };
 
 module.exports = {
+    prepareUserData,
+    sendPayloadToMeta,
     queueMetaEvent,
-    processPendingQueue
+    sendEventLogImmediately,
+    queueAndSendMetaEvent,
+    processPendingQueue,
+    normalizeStatus,
+    GRAPH_API_BASE_URL
 };

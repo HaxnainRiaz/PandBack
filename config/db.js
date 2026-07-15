@@ -3,7 +3,8 @@ const mongoose = require('mongoose');
 const cached = globalThis.mongoose || {
     conn: null,
     promise: null,
-    listenersAttached: false
+    listenersAttached: false,
+    reconnecting: false
 };
 globalThis.mongoose = cached;
 
@@ -11,14 +12,24 @@ function attachConnectionListeners() {
     if (cached.listenersAttached) return;
     cached.listenersAttached = true;
 
+    mongoose.connection.on('connected', () => {
+        cached.reconnecting = false;
+        console.log('[MongoDB] Connection established');
+    });
+
     mongoose.connection.on('disconnected', () => {
         cached.conn = null;
         cached.promise = null;
-        console.warn('[MongoDB] Connection closed');
+        console.warn('[MongoDB] Connection closed — will reconnect on next request');
     });
+
     mongoose.connection.on('error', (error) => {
         console.error('[MongoDB] Connection error:', error.message);
     });
+}
+
+function isDbReady() {
+    return mongoose.connection.readyState === 1;
 }
 
 async function connectDB() {
@@ -28,24 +39,27 @@ async function connectDB() {
     const dbName = uri.split('?')[0].split('/').pop();
     if (!dbName) throw new Error('MONGODB_URI must include a database name');
 
-    if (cached.conn && mongoose.connection.readyState === 1) return cached.conn;
+    if (cached.conn && isDbReady()) return cached.conn;
     if (cached.promise) return cached.promise;
 
     attachConnectionListeners();
     console.log('[MongoDB] Creating connection');
 
-    cached.promise = mongoose.connect(uri, {
+    const options = {
         bufferCommands: false,
-        serverSelectionTimeoutMS: 8000,
-        connectTimeoutMS: 10000,
-        socketTimeoutMS: 20000,
-        maxPoolSize: 5,
-        minPoolSize: 0,
-        maxIdleTimeMS: 30000,
+        serverSelectionTimeoutMS: 15000,
+        connectTimeoutMS: 15000,
+        socketTimeoutMS: 45000,
+        maxPoolSize: 10,
+        minPoolSize: 1,
+        maxIdleTimeMS: 60000,
+        heartbeatFrequencyMS: 10000,
         retryReads: true,
         retryWrites: true,
         autoIndex: false
-    }).then((connection) => {
+    };
+
+    cached.promise = mongoose.connect(uri, options).then((connection) => {
         cached.conn = connection;
         console.log(`[MongoDB] Connected to ${connection.connection.name}`);
         return connection;
@@ -58,4 +72,28 @@ async function connectDB() {
     return cached.promise;
 }
 
+/**
+ * Ensure DB is connected; retries transient failures (cold start, brief blip).
+ */
+async function ensureDbConnected(maxAttempts = 3) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (isDbReady()) return mongoose.connection;
+            await connectDB();
+            if (isDbReady()) return mongoose.connection;
+        } catch (error) {
+            lastError = error;
+            cached.conn = null;
+            cached.promise = null;
+            if (attempt < maxAttempts) {
+                await new Promise(r => setTimeout(r, attempt * 400));
+            }
+        }
+    }
+    throw lastError || new Error('Database connection failed');
+}
+
 module.exports = connectDB;
+module.exports.ensureDbConnected = ensureDbConnected;
+module.exports.isDbReady = isDbReady;

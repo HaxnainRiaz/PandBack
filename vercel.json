@@ -12,6 +12,12 @@
             "dest": "server.js"
         }
     ],
+    "crons": [
+        {
+            "path": "/api/meta/events/process-queue",
+            "schedule": "*/5 * * * *"
+        }
+    ],
     "env": {
         "ENABLE_WORKERS": "false"
     }

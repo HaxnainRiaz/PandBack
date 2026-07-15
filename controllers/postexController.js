@@ -4,6 +4,7 @@ const OrderEvent = require('../models/OrderEvent');
 const PostExIntegration = require('../models/PostExIntegration');
 const mongoose = require('mongoose');
 const postexService = require('../services/postex.service');
+const { prepareBookingPayload, mapWithConcurrency } = require('../utils/postexBooking');
 
 function getOwnerId(req) {
     const ownerId = req.user?._id || req.admin?._id || req.user?.id;
@@ -80,7 +81,9 @@ function validateBulkPayload(payload) {
     if (!payload.customerName) missing.push('customerName');
     if (!payload.customerPhone) missing.push('customerPhone');
     if (!payload.deliveryAddress) missing.push('deliveryAddress');
-    if (!payload.pickupAddressCode) missing.push('pickupAddressCode');
+    if (!payload.pickupAddressCode && !payload.storeAddressCode) {
+        missing.push('pickupAddressCode or storeAddressCode (configure in PostEx Settings)');
+    }
     if (payload.invoicePayment === undefined || Number.isNaN(payload.invoicePayment)) {
         missing.push('invoicePayment');
     }
@@ -174,23 +177,38 @@ exports.bookOrderOnPostEx = async (req, res) => {
         }
 
         // ── Build exact PostEx v3 payload ──────────────────────────────────────
-        const payload = {
+        const ownerId = getOwnerId(req);
+        if (!ownerId) {
+            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
+        }
+        const integration = await ensurePostExConfigured(ownerId);
+
+        const draftPayload = {
             orderRefNumber,
-            orderType:       orderType || 'Normal',
+            orderType: orderType || 'Normal',
             cityName,
             customerName,
             customerPhone,
             deliveryAddress,
-            items:           itemsCount, // Some versions expect number
-            itemsDetail:     itemsArray,  // Some versions expect array
-            orderDetail:     itemsArray.map(i => `${i.productName} x${i.quantity}`).join(', ').substring(0, 500),
-            totalAmount,
-            codAmount,
-            weight:          packageWeight,
-            remarks:         bookingRemarks,
-            ...(pickupAddressCode && { pickupAddressCode }),
-            ...(storeAddressCode  && { storeAddressCode })
+            invoicePayment: codAmount,
+            invoiceDivision: 1,
+            items: itemsCount,
+            orderDetail: itemsArray.map(i => `${i.productName} x${i.quantity}`).join(', ').substring(0, 500),
+            transactionNotes: bookingRemarks,
+            pickupAddressCode,
+            storeAddressCode
         };
+
+        const prepared = await prepareBookingPayload(ownerId, draftPayload, integration);
+        if (prepared.error) {
+            return res.status(422).json({
+                success: false,
+                message: prepared.error,
+                availableCities: prepared.cities?.slice(0, 20).map(c => c.name)
+            });
+        }
+
+        const payload = prepared.payload;
 
         // Log request
         try {
@@ -203,12 +221,6 @@ exports.bookOrderOnPostEx = async (req, res) => {
         } catch (logErr) { console.warn('ShipmentLog write error:', logErr.message); }
 
         // ── Call PostEx API ────────────────────────────────────────────────────
-        const ownerId = getOwnerId(req);
-        if (!ownerId) {
-            return res.status(401).json({ success: false, code: 'INVALID_OWNER_ID', message: 'Authenticated admin ID is required' });
-        }
-        await ensurePostExConfigured(ownerId);
-
         const response = await postexService.createOrder(ownerId, payload);
 
         // PostEx returns HTTP 200 for BOTH success and failure.
@@ -666,7 +678,17 @@ exports.bulkBookPostEx = async (req, res) => {
                 return { orderId, status: 'rejected', reason: 'Order is cancelled' };
             }
 
-            const payload = buildBulkBookingPayload(order, entryPayload, integration);
+            const draftPayload = buildBulkBookingPayload(order, entryPayload, integration);
+            const prepared = await prepareBookingPayload(ownerId, draftPayload, integration);
+            if (prepared.error) {
+                return {
+                    orderId,
+                    status: 'rejected',
+                    reason: prepared.error
+                };
+            }
+
+            const payload = prepared.payload;
             const missing = validateBulkPayload(payload);
             if (missing.length) {
                 return {
@@ -710,7 +732,7 @@ exports.bulkBookPostEx = async (req, res) => {
         };
 
         if (shipments && Array.isArray(shipments)) {
-            const results = await Promise.allSettled(shipments.map((entry) => processShipment(entry)));
+            const results = await mapWithConcurrency(shipments, (entry) => processShipment(entry), 3);
 
             let successCount = 0;
             const failedOrders = [];
@@ -754,25 +776,19 @@ exports.bulkBookPostEx = async (req, res) => {
 
         for (const order of orders) {
             try {
-                const customerName = order.customerName || order.shippingAddress?.fullName;
-                const customerPhone = order.shippingAddress?.phone;
-                const deliveryAddress = `${order.shippingAddress?.street}, ${order.shippingAddress?.city}`;
-                const cityName = order.shippingAddress?.city;
-                const itemsCount = order.items.reduce((acc, item) => acc + item.quantity, 0);
+                const draftPayload = buildBulkBookingPayload(order, {}, integration);
+                const prepared = await prepareBookingPayload(ownerId, draftPayload, integration);
+                if (prepared.error) {
+                    failedOrders.push({ orderId: order._id, reason: prepared.error });
+                    continue;
+                }
 
-                const payload = {
-                    cityName,
-                    customerName,
-                    customerPhone,
-                    deliveryAddress,
-                    invoiceDivision: 1,
-                    invoicePayment: order.totalAmount,
-                    items: itemsCount,
-                    orderDetail: 'Order Items',
-                    orderRefNumber: order._id.toString(),
-                    orderType: 'Normal',
-                    pickupAddressCode: 'DEFAULT',
-                };
+                const payload = prepared.payload;
+                const missing = validateBulkPayload(payload);
+                if (missing.length) {
+                    failedOrders.push({ orderId: order._id, reason: `Missing fields: ${missing.join(', ')}` });
+                    continue;
+                }
 
                 const response = await postexService.createOrder(ownerId, payload);
                 if (String(response.statusCode) === '200') {

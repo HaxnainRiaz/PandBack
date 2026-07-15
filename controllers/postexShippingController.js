@@ -4,6 +4,7 @@ const PostExShipment = require('../models/PostExShipment');
 const Order = require('../models/Order');
 const OrderEvent = require('../models/OrderEvent');
 const ShipmentLog = require('../models/ShipmentLog');
+const { prepareBookingPayload } = require('../utils/postexBooking');
 
 const POSTEX_TO_LOCAL_STATUS = {
     'Booked': 'Booked',
@@ -97,14 +98,14 @@ exports.createShipment = async (req, res) => {
         const resolvedStore   = storeAddressCode  || integration?.defaultStoreAddressCode;
 
         const missing = [];
-        if (!resolvedCity)   missing.push('cityName');
         if (!resolvedName)   missing.push('customerName');
         if (!resolvedPhone)  missing.push('customerPhone');
         if (!resolvedAddr)   missing.push('deliveryAddress');
         if (!resolvedCOD && resolvedCOD !== 0) missing.push('invoicePayment');
+        if (!resolvedCity)   missing.push('cityName');
         if (missing.length) return res.status(422).json({ success: false, message: `Missing fields: ${missing.join(', ')}` });
 
-        const payload = {
+        const draftPayload = {
             orderRefNumber: order.orderNumber || order._id.toString(),
             orderType: orderType || 'Normal',
             cityName: resolvedCity,
@@ -116,9 +117,20 @@ exports.createShipment = async (req, res) => {
             items: resolvedItems,
             orderDetail: resolvedDetail,
             transactionNotes: transactionNotes || order.transactionNotes || '',
-            ...(resolvedPickup && { pickupAddressCode: resolvedPickup }),
-            ...(resolvedStore  && { storeAddressCode:  resolvedStore })
+            pickupAddressCode: resolvedPickup,
+            storeAddressCode: resolvedStore
         };
+
+        const prepared = await prepareBookingPayload(req.user._id, draftPayload, integration);
+        if (prepared.error) {
+            return res.status(422).json({
+                success: false,
+                message: prepared.error,
+                availableCities: prepared.cities?.slice(0, 20).map(c => c.name)
+            });
+        }
+
+        const payload = prepared.payload;
 
         // Log request
         await ShipmentLog.create({ orderId: order._id, action: 'CREATE_ORDER', endpoint: '/v3/create-order', requestPayload: payload }).catch(() => {});

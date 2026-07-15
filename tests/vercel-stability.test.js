@@ -72,11 +72,11 @@ async function testHttpRoutes(port) {
             host: '127.0.0.1',
             port,
             path: '/health',
-            headers: { Origin: 'https://pandaemart.com' }
+            headers: { Origin: 'https://http://localhost:3000' }
         }, (res) => resolve(res.headers['access-control-allow-origin']));
         req.on('error', reject);
     });
-    assert.strictEqual(corsOrigin, 'https://pandaemart.com');
+    assert.strictEqual(corsOrigin, 'https://http://localhost:3000');
     console.log('  Production webstore origin is allowed by CORS');
 
     const preflight = await new Promise((resolve, reject) => {

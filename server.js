@@ -20,6 +20,7 @@ if (!isProduction && process.env.FORCE_PUBLIC_DNS === 'true') {
 }
 
 const connectDB = require('./config/db');
+const { ensureDbConnected } = connectDB;
 const Media = require('./models/Media');
 
 const app = express();
@@ -42,8 +43,8 @@ const allowedOrigins = [
     'https://panda-panel-puce.vercel.app',
     'https://pand-back.vercel.app',
     'https://luminelle.org',
-    'https://pandaemart.com',
-    'https://www.pandaemart.com'
+    'https://http://localhost:3000',
+    'https://www.http://localhost:3000'
 ].filter(Boolean);
 
 const allowedOriginPatterns = [
@@ -141,10 +142,20 @@ app.get('/api/config/status', (req, res) => {
     });
 });
 
-app.get('/api/health', (req, res) => {
-    res.status(200).json({
-        status: 'ok',
+app.get('/api/health', async (req, res) => {
+    const mongoose = require('mongoose');
+    let dbStatus = 'unknown';
+    try {
+        await ensureDbConnected(2);
+        dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    } catch {
+        dbStatus = 'unavailable';
+    }
+
+    res.status(dbStatus === 'connected' ? 200 : 503).json({
+        status: dbStatus === 'connected' ? 'ok' : 'degraded',
         service: 'backend',
+        database: dbStatus,
         uptime: Math.floor((Date.now() - serverStartedAt) / 1000),
         timestamp: new Date().toISOString()
     });
@@ -152,14 +163,15 @@ app.get('/api/health', (req, res) => {
 
 const requireDatabase = async (req, res, next) => {
     try {
-        await connectDB();
+        await ensureDbConnected(3);
         return next();
     } catch (error) {
         res.locals.errorMessage = error.message;
         console.error('[MongoDB] Request connection failed:', error.message);
         return res.status(503).json({
             success: false,
-            message: 'Database temporarily unavailable'
+            message: 'Database temporarily unavailable. Please try again shortly.',
+            retryable: true
         });
     }
 };
@@ -307,7 +319,7 @@ if (!isVercel) {
     const io = socketUtil.init(server);
 
     io.on('connection', (socket) => {
-        socket.on('disconnect', () => {});
+        socket.on('disconnect', () => { });
     });
 
     const PORT = process.env.PORT || 5000;
