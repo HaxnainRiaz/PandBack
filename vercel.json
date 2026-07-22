@@ -19,6 +19,19 @@
     }
   ],
   "env": {
-    "ENABLE_WORKERS": "false"
+    "NODE_ENV": "production",
+    "ENABLE_WORKERS": "false",
+    "BACKEND_URL": "https://pand-back.vercel.app",
+    "ADMIN_URL": "https://panda-panel-puce.vercel.app",
+    "ADMIN_APP_URL": "https://panda-panel-puce.vercel.app",
+    "FRONTEND_URL": "https://panda-panel-puce.vercel.app",
+    "WEBSTORE_URL": "https://pandaemart.com",
+    "CLIENT_URL": "https://pandaemart.com",
+    "POSTEX_BASE_URL": "https://api.postex.pk/services/integration/api/order",
+    "META_GRAPH_API_VERSION": "v18.0",
+    "META_REDIRECT_URI": "https://pand-back.vercel.app/api/meta/oauth/callback",
+    "UPLOAD_PROVIDER": "auto",
+    "ALLOW_LOCAL_UPLOAD_FALLBACK": "false"
   }
 }
+

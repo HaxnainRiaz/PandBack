@@ -55,8 +55,8 @@ function buildBulkBookingPayload(order, entryPayload, integration) {
         ? Number(entryPayload.invoicePayment)
         : (order.paymentStatus === 'paid' ? 0 : Number(order.totalAmount || 0));
 
-    const pickupAddressCode = entryPayload?.pickupAddressCode || integration?.defaultPickupAddressCode || '';
-    const storeAddressCode = entryPayload?.storeAddressCode || integration?.defaultStoreAddressCode || '';
+    const pickupAddressCode = (entryPayload?.pickupAddressCode || integration?.defaultPickupAddressCode || '').trim();
+    const storeAddressCode = (entryPayload?.storeAddressCode || integration?.defaultStoreAddressCode || '').trim();
 
     return {
         orderRefNumber: entryPayload?.orderRefNumber || order.orderNumber || String(order._id),
@@ -70,8 +70,7 @@ function buildBulkBookingPayload(order, entryPayload, integration) {
         items: Number(entryPayload?.items) || itemsCount || 1,
         orderDetail: entryPayload?.orderDetail || itemsDetail || 'Order items',
         transactionNotes: entryPayload?.transactionNotes || order.transactionNotes || '',
-        ...(pickupAddressCode && { pickupAddressCode }),
-        ...(storeAddressCode && { storeAddressCode })
+        ...(pickupAddressCode ? { pickupAddressCode } : (storeAddressCode ? { storeAddressCode } : {}))
     };
 }
 
@@ -569,7 +568,8 @@ exports.bulkPreparePostEx = async (req, res) => {
             return res.status(400).json({ success: false, message: 'orderIds array is required' });
         }
 
-        const validIds = orderIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+        // Deduplicate IDs so the same orderId can't produce two rows (React duplicate-key bug)
+        const validIds = [...new Set(orderIds.filter((id) => mongoose.Types.ObjectId.isValid(id)))];
         if (!validIds.length) {
             return res.status(400).json({ success: false, message: 'No valid order IDs provided' });
         }

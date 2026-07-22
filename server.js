@@ -26,29 +26,33 @@ const Media = require('./models/Media');
 const app = express();
 
 const allowedOrigins = [
+    // --- From environment variables (set in Vercel dashboard) ---
     process.env.CLIENT_URL,
     process.env.FRONTEND_URL,
     process.env.ADMIN_URL,
     process.env.ADMIN_APP_URL,
     process.env.WEBSTORE_URL,
     process.env.BACKEND_URL,
+    // --- Hardcoded production URLs (failsafe if env vars are missing) ---
+    'https://pandaemart.com',
+    'https://www.pandaemart.com',
+    'https://panda-panel-puce.vercel.app',
+    'https://pand-back.vercel.app',
+    'https://store-pannel.vercel.app',
+    'https://store-admin-one.vercel.app',
+    'https://luminelle.org',
+    // --- Local development ---
     'http://localhost:3000',
     'http://localhost:3001',
     'http://localhost:5000',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:3001',
     'http://127.0.0.1:5000',
-    'https://store-pannel.vercel.app',
-    'https://store-admin-one.vercel.app',
-    'https://panda-panel-puce.vercel.app',
-    'https://pand-back.vercel.app',
-    'https://luminelle.org',
-    'https://http://localhost:3000',
-    'https://www.http://localhost:3000'
 ].filter(Boolean);
 
 const allowedOriginPatterns = [
-    /^https:\/\/panda-panel-puce(?:-[a-z0-9-]+)?\.vercel\.app$/i
+    /^https:\/\/panda-panel-puce(?:-[a-z0-9-]+)?\.vercel\.app$/i,
+    /^https:\/\/pand-back(?:-[a-z0-9-]+)?\.vercel\.app$/i,
 ];
 
 const isAllowedOrigin = (origin) => !origin || allowedOrigins.includes(origin) ||

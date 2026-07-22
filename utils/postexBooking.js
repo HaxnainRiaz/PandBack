@@ -70,31 +70,35 @@ function pickFirstAddressCode(addresses, preferredType) {
 }
 
 /**
- * PostEx requires at least one of pickupAddressCode or storeAddressCode.
+ * PostEx requires either pickupAddressCode or storeAddressCode (never both or invalid codes).
  */
 function resolveAddressCodes({ pickupAddressCode, storeAddressCode, integration, addresses = [] }) {
-    let pickup = (pickupAddressCode || integration?.defaultPickupAddressCode || '').trim();
-    let store = (storeAddressCode || integration?.defaultStoreAddressCode || '').trim();
+    const pickup = (pickupAddressCode || integration?.defaultPickupAddressCode || '').trim();
+    const store = (storeAddressCode || integration?.defaultStoreAddressCode || '').trim();
 
-    if (!pickup) {
-        pickup = pickFirstAddressCode(addresses, 'pickup') || '';
-    }
-    if (!store) {
-        store = pickFirstAddressCode(addresses, 'store') || '';
+    // Prefer pickupAddressCode if present; PostEx validates storeAddressCode separately if provided
+    if (pickup) {
+        return { pickupAddressCode: pickup };
     }
 
-    if (!pickup && !store) {
-        return {
-            pickupAddressCode: null,
-            storeAddressCode: null,
-            error: 'No pickup or store address configured. Set defaults in PostEx → Settings or add a merchant address in your PostEx account.'
-        };
+    if (store) {
+        return { storeAddressCode: store };
     }
 
-    const result = {};
-    if (pickup) result.pickupAddressCode = pickup;
-    if (store) result.storeAddressCode = store;
-    return result;
+    // Fall back to first available address in merchant account
+    const firstPickup = pickFirstAddressCode(addresses, 'pickup');
+    if (firstPickup) {
+        return { pickupAddressCode: firstPickup };
+    }
+
+    const firstStore = pickFirstAddressCode(addresses, 'store');
+    if (firstStore) {
+        return { storeAddressCode: firstStore };
+    }
+
+    return {
+        error: 'No pickup address configured. Select a pickup location in manifest or set a default in PostEx Settings.'
+    };
 }
 
 /**
@@ -127,9 +131,14 @@ async function prepareBookingPayload(ownerId, payload, integration) {
         return { error: codes.error, cities, addresses };
     }
 
+    // Strip any raw address codes from input so resolved codes override completely
+    const cleanPayload = { ...payload };
+    delete cleanPayload.pickupAddressCode;
+    delete cleanPayload.storeAddressCode;
+
     return {
         payload: {
-            ...payload,
+            ...cleanPayload,
             cityName: matchedCity,
             ...codes
         },
