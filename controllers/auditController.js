@@ -3,6 +3,8 @@ require('../models/User'); // Ensure User model is registered for populate
 
 // @desc    Get all audit logs
 // @access  Private/Admin
+
+
 exports.getAuditLogs = async (req, res) => {
     try {
         console.log('Fetching Audit Logs...');
