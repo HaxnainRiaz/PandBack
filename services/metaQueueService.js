@@ -227,13 +227,18 @@ const queueMetaEvent = async (eventDetails) => {
             return { success: false, error: 'CAPI disabled', logId: skippedLog._id, skipped: true };
         }
 
+        const isDev = process.env.NODE_ENV === 'development';
         const user_data = prepareUserData(rawUserData);
+        const resolvedSourceUrl = (eventSourceUrl && !eventSourceUrl.includes('https://http://'))
+            ? eventSourceUrl
+            : (process.env.WEBSTORE_URL || 'https://pandaemart.com');
+
         const requestPayloadSafe = {
             event_name: eventName,
             event_time: eventTime,
             event_id: eventId,
             action_source: 'website',
-            event_source_url: eventSourceUrl || process.env.WEBSTORE_URL || 'https://http://localhost:3000',
+            event_source_url: resolvedSourceUrl,
             user_data,
             custom_data: {
                 ...customData,
@@ -246,7 +251,7 @@ const queueMetaEvent = async (eventDetails) => {
         const hasEmailHash = !!(user_data.em && user_data.em.length > 0);
         const hasPhoneHash = !!(user_data.ph && user_data.ph.length > 0);
         const hasExternalId = !!(user_data.external_id && user_data.external_id.length > 0);
-        const testEventCodeUsed = testEventCode || '';
+        const testEventCodeUsed = (isDev || testEventCode) ? (testEventCode || process.env.META_TEST_EVENT_CODE || '') : '';
 
         const existingSent = await MetaEventLog.findOne({
             eventName,

@@ -106,7 +106,7 @@ async function runSafetyAuditSuite() {
         const res = await axios.post('http://localhost:5555/api/tracking/meta/event', {
             eventName: 'PageView',
             eventId: `recursion-test-${Date.now()}`,
-            eventSourceUrl: 'https://store.luminelle.org/',
+            eventSourceUrl: 'https://store.pandaemart.com/',
             userData: { email: 'recursion@example.com' }
         });
 

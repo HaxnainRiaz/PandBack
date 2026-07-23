@@ -40,7 +40,7 @@ const allowedOrigins = [
     'https://pand-back.vercel.app',
     'https://store-pannel.vercel.app',
     'https://store-admin-one.vercel.app',
-    'https://luminelle.org',
+    'https://pandaemart.com',
     // --- Local development ---
     'http://localhost:3000',
     'http://localhost:3001',

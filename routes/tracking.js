@@ -44,11 +44,19 @@ router.post('/meta/event', optional, async (req, res) => {
             if (!enrichedUserData.externalId && req.user._id) enrichedUserData.externalId = String(req.user._id);
         }
 
+        const reqReferer = req.headers['referer'];
+        const reqHost = req.headers['x-forwarded-host'] || req.headers['host'];
+        const reqProto = req.headers['x-forwarded-proto'] || 'https';
+        const fallbackBeaconSourceUrl = reqHost ? `${reqProto}://${reqHost}/` : `${process.env.WEBSTORE_URL || 'https://pandaemart.com'}/`;
+        const resolvedBeaconSourceUrl = (eventSourceUrl && !eventSourceUrl.includes('https://http://'))
+            ? eventSourceUrl
+            : (reqReferer || fallbackBeaconSourceUrl);
+
         const result = await queueAndSendMetaEvent({
             eventName,
             eventId,
             orderId,
-            eventSourceUrl: eventSourceUrl || req.headers.referer,
+            eventSourceUrl: resolvedBeaconSourceUrl,
             userData: enrichedUserData,
             customData
         }, { lockedBy: 'tracking-beacon' });

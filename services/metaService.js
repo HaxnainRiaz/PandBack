@@ -25,12 +25,16 @@ exports.sendCapiEvent = async (config, { eventName, eventId, eventTime, eventSou
     }
 
     const user_data = prepareUserData(userData);
+    const resolvedSourceUrl = (eventSourceUrl && !eventSourceUrl.includes('https://http://'))
+        ? eventSourceUrl
+        : (process.env.WEBSTORE_URL || 'https://pandaemart.com');
+
     const requestPayloadSafe = {
         event_name: eventName,
         event_time: Math.floor((eventTime || Date.now()) / 1000),
         event_id: eventId,
         action_source: 'website',
-        event_source_url: eventSourceUrl || process.env.WEBSTORE_URL || 'https://http://localhost:3000',
+        event_source_url: resolvedSourceUrl,
         user_data,
         custom_data: {
             ...customData,
@@ -43,7 +47,8 @@ exports.sendCapiEvent = async (config, { eventName, eventId, eventTime, eventSou
     const hasEmailHash = !!(user_data.em && user_data.em.length > 0);
     const hasPhoneHash = !!(user_data.ph && user_data.ph.length > 0);
     const hasExternalId = !!(user_data.external_id && user_data.external_id.length > 0);
-    const testCode = testEventCode || null;
+    const isDev = process.env.NODE_ENV === 'development';
+    const testCode = testEventCode || (isDev ? process.env.META_TEST_EVENT_CODE : null);
 
     let log = await MetaEventLog.findOne({ eventName, eventId, source: 'server' });
     if (!log) {

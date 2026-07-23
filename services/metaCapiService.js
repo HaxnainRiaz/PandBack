@@ -56,6 +56,12 @@ exports.sendMetaCapiEvent = async (eventName, eventData) => {
             accessToken = decryptToken(accessToken);
         }
 
+        const isDev = process.env.NODE_ENV === 'development';
+        const activeTestCode = testEventCode || (isDev ? process.env.META_TEST_EVENT_CODE : undefined);
+        const resolvedSourceUrl = (eventSourceUrl && !eventSourceUrl.includes('https://http://'))
+            ? eventSourceUrl
+            : (process.env.WEBSTORE_URL || 'https://pandaemart.com');
+
         // 3. Prepare Payload
         const payload = {
             data: [{
@@ -63,7 +69,7 @@ exports.sendMetaCapiEvent = async (eventName, eventData) => {
                 event_time: eventTime,
                 event_id: eventId,
                 action_source: 'website',
-                event_source_url: eventSourceUrl || process.env.WEBSTORE_URL || 'https://luminelle.org',
+                event_source_url: resolvedSourceUrl,
                 user_data: {
                     em: userData.email ? [hashData(userData.email)] : undefined,
                     ph: userData.phone ? [hashPhone(userData.phone)] : undefined,
@@ -80,8 +86,8 @@ exports.sendMetaCapiEvent = async (eventName, eventData) => {
             }]
         };
 
-        if (testEventCode) {
-            payload.test_event_code = testEventCode;
+        if (activeTestCode && (isDev || testEventCode)) {
+            payload.test_event_code = activeTestCode;
         }
 
         // Remove undefined fields from user_data

@@ -65,7 +65,7 @@ async function runRegressionSuite() {
         const res = await axios.post('http://localhost:5555/api/tracking/meta/event', {
             eventName: 'ViewContent',
             eventId: `regression-valid-${Date.now()}`,
-            eventSourceUrl: 'https://store.luminelle.org/products/cream',
+            eventSourceUrl: 'https://store.pandaemart.com/products/cream',
             userData: { email: 'regression@example.com' }
         });
         if (res.status === 202 && res.data.success === true) {
@@ -84,7 +84,7 @@ async function runRegressionSuite() {
         console.log(`${BOLD}${BLUE}[Test 3] POST /api/tracking/meta/event (Missing eventId -> 400)${RESET}`);
         await axios.post('http://localhost:5555/api/tracking/meta/event', {
             eventName: 'ViewContent',
-            eventSourceUrl: 'https://store.luminelle.org/products/cream'
+            eventSourceUrl: 'https://store.pandaemart.com/products/cream'
         });
         console.error(`  ❌ Status: ${RED}FAIL${RESET} (Request succeeded but should have returned 400)\n`);
         suitePassed = false;
@@ -103,7 +103,7 @@ async function runRegressionSuite() {
         console.log(`${BOLD}${BLUE}[Test 4] POST /api/tracking/meta/event (Missing eventName -> 400)${RESET}`);
         await axios.post('http://localhost:5555/api/tracking/meta/event', {
             eventId: `regression-missing-name-${Date.now()}`,
-            eventSourceUrl: 'https://store.luminelle.org/products/cream'
+            eventSourceUrl: 'https://store.pandaemart.com/products/cream'
         });
         console.error(`  ❌ Status: ${RED}FAIL${RESET} (Request succeeded but should have returned 400)\n`);
         suitePassed = false;
@@ -183,7 +183,7 @@ async function runRegressionSuite() {
         const res = await axios.post('http://localhost:5555/api/tracking/meta/event', {
             eventName: 'Purchase',
             eventId: `regression-sla-${Date.now()}`,
-            eventSourceUrl: 'https://store.luminelle.org/checkout',
+            eventSourceUrl: 'https://store.pandaemart.com/checkout',
             userData: { email: 'sla@example.com' }
         });
         const elapsed = Date.now() - start;

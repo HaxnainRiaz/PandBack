@@ -622,7 +622,7 @@ exports.testEvent = async (req, res) => {
         const testData = {
             eventName,
             eventId,
-            eventSourceUrl: req.headers.referer || process.env.FRONTEND_URL || process.env.WEBSTORE_URL || 'https://http://localhost:3000',
+            eventSourceUrl: req.headers.referer || process.env.WEBSTORE_URL || 'https://pandaemart.com',
             userData: {
                 email: userData.email || 'test@example.com',
                 phone: userData.phone || '1234567890',

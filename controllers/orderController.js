@@ -186,11 +186,19 @@ exports.addOrderItems = async (req, res) => {
                     return;
                 }
 
+                const reqReferer = req.headers['referer'];
+                const reqHost = req.headers['x-forwarded-host'] || req.headers['host'];
+                const reqProto = req.headers['x-forwarded-proto'] || 'https';
+                const fallbackSourceUrl = reqHost ? `${reqProto}://${reqHost}/checkout` : `${process.env.WEBSTORE_URL || 'https://pandaemart.com'}/checkout`;
+                const resolvedOrderSourceUrl = (req.body.eventSourceUrl && !req.body.eventSourceUrl.includes('https://http://'))
+                    ? req.body.eventSourceUrl
+                    : (reqReferer || fallbackSourceUrl);
+
                 const eventDetails = {
                     eventName: 'Purchase',
                     eventId: purchaseEventId,
                     orderId: createdOrder._id,
-                    eventSourceUrl: req.body.eventSourceUrl || `${process.env.WEBSTORE_URL || 'https://http://localhost:3000'}/checkout`,
+                    eventSourceUrl: resolvedOrderSourceUrl,
                     userData: {
                         email: shippingAddress.email || (req.user ? req.user.email : undefined),
                         phone: shippingAddress.phone,
