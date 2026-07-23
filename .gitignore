@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.production
 .env.local
+.env.example
 
 # Secrets & credentials (never commit)
 config/firebase-service-account.json
