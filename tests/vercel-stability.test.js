@@ -86,7 +86,7 @@ async function testHttpRoutes(port) {
             path: '/api/auth/login',
             method: 'OPTIONS',
             headers: {
-                Origin: 'https://panda-panel-puce.vercel.app',
+                Origin: 'https://panda-panel-sable.vercel.app',
                 'Access-Control-Request-Method': 'POST',
                 'Access-Control-Request-Headers': 'content-type'
             }
@@ -97,7 +97,7 @@ async function testHttpRoutes(port) {
     assert.strictEqual(preflight.statusCode, 204);
     assert.strictEqual(
         preflight.headers['access-control-allow-origin'],
-        'https://panda-panel-puce.vercel.app'
+        'https://panda-panel-sable.vercel.app'
     );
     assert.ok(preflight.headers['access-control-allow-methods'].includes('POST'));
     console.log('  Admin login preflight returns 204 before database middleware');

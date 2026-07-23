@@ -36,7 +36,7 @@ const allowedOrigins = [
     // --- Hardcoded production URLs (failsafe if env vars are missing) ---
     'https://pandaemart.com',
     'https://www.pandaemart.com',
-    'https://panda-panel-puce.vercel.app',
+    'https://panda-panel-sable.vercel.app',
     'https://pand-back.vercel.app',
     'https://store-pannel.vercel.app',
     'https://store-admin-one.vercel.app',
